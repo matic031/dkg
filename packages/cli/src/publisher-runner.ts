@@ -536,7 +536,7 @@ async function createPublisherStore(dataDir: string, config: DkgConfig): Promise
   }
 
   return await createTripleStore({
-    backend: 'oxigraph-worker',
+    backend: 'oxigraph-persistent',
     options: { path: join(dataDir, 'store.nq') },
     largeLiteralStorage: defaultLargeLiteralStorage(dataDir, config),
   });
@@ -563,7 +563,6 @@ export function createPublicSnapshotStore(
 
 function isLocalOxigraphStoreConfig(storeConfig: { backend?: unknown }): boolean {
   return storeConfig.backend === 'oxigraph'
-    || storeConfig.backend === 'oxigraph-worker'
     || storeConfig.backend === 'oxigraph-persistent';
 }
 

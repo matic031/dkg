@@ -176,7 +176,7 @@ program
   .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
   .option(
     '--store <backend>',
-    'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
+    'Pre-fill the triple-store backend prompt (oxigraph-server | oxigraph | blazegraph | sparql-http).',
   )
   .option(
     '--store-url <url>',
@@ -436,9 +436,8 @@ program
       chain: chainSection ?? existing.chain,
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
       // Persist the chosen backend. `storeBlock === null` from the
-      // wizard means "use the local default" — we explicitly clear any
-      // existing block so re-running `dkg init` to switch from
-      // blazegraph back to oxigraph actually applies.
+      // wizard means "leave the store block omitted"; daemon boot treats
+      // that as the managed `oxigraph-server` default.
       store: storeBlock ?? undefined,
     };
     await saveConfig(config);
@@ -475,7 +474,7 @@ program
               const endpoint = o?.url ?? o?.queryEndpoint;
               return `${storeBlock.backend}${endpoint ? ` (${endpoint})` : ''}`;
             })()
-          : 'oxigraph (local default)'
+          : 'oxigraph-server (default)'
       }`,
     );
     {

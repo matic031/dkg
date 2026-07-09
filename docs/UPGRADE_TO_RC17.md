@@ -1,5 +1,9 @@
 # Upgrading to `v10.0.0-rc.17` — land it clean
 
+> **Historical note:** this guide describes the rc.17 storage behavior. Current
+> v10 builds have retired `oxigraph-worker`; use `oxigraph-server` or an
+> external SPARQL backend for daemon storage.
+
 **Audience:** DKG **node operators** (edge + core) on V10 Testnet (Base
 Sepolia) upgrading from any pre-rc.17 build (rc.12 → rc.16), plus anyone
 spinning up a node for the first time on rc.17.

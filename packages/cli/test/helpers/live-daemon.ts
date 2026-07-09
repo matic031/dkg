@@ -87,7 +87,7 @@ export async function startLiveDaemon(opts: StartDaemonOpts = {}): Promise<LiveD
       nodeRole: 'edge',
       relay: 'none',
       auth: { enabled: authEnabled },
-      store: { backend: 'oxigraph-worker', options: { path: join(home, 'store.nq') } },
+      store: { backend: 'oxigraph-persistent', options: { path: join(home, 'store.nq') } },
       chain: { type: 'evm', rpcUrl, hubAddress, chainId: 'evm:31337' },
       contextGraphs: [],
       ...(opts.extraConfig ?? {}),

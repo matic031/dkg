@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Removed — `oxigraph-worker` backend support
+
+- **The embedded `oxigraph-worker` backend is retired.** The storage package no longer exports or registers the worker-thread adapter, `createTripleStore({ backend: "oxigraph-worker" })` fails with an actionable migration error, and CLI config validation refuses explicit `store.backend: "oxigraph-worker"` before daemon boot. Block-less configs now resolve to the daemon-managed `oxigraph-server` default; if a legacy `store.nq` file exists, daemon boot requires `DKG_ACCEPT_STORE_RESET=1` so operators acknowledge the fresh-store cutover.
+
 ### Fixed — `dkg init` on monorepo checkouts + oxigraph-server default for adapter/MCP setups (#960)
 
 - **V10 publish/update allowance recovery now translates raw ethers custom-error data before `TooLowAllowance` classification** (`packages/chain/src/evm-adapter.ts`): the shared populate-and-sign recovery gate decodes raw provider revert data first, so a fresh node can force one re-approval and retry when RPC allowance reads lag behind a mined TRAC approval.

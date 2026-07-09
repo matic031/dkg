@@ -46,7 +46,7 @@ describe.sequential.skip('publisher CLI smoke', () => {
         contextGraphs: [],
         auth: { enabled: false },
         store: {
-          backend: 'oxigraph-worker',
+          backend: 'oxigraph-persistent',
           options: { path: join(dkgHome, 'store.nq') },
         },
       }),
