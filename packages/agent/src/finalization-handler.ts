@@ -51,6 +51,31 @@ import {
 export const KEEP_ROOT_COPY_PREDICATE = `${DKG_NS}keepRootCopyOnLabel`;
 
 /**
+ * Reader-maintained memo (#1609): the flat-KC merkle root a WorkspaceOperation's
+ * SWM snapshot hashes to, stamped onto the op subject (`urn:dkg:share:<cg>:<id>`)
+ * the first time `findSwmSnapshotInNamespace` recomputes it. Lets a chain-reconcile
+ * lookup resolve the matching op by root directly, instead of recomputing every
+ * op's root on every sweep — the absent-KA scan that dominates beacon reconcile
+ * load (a KA published elsewhere forces a full O(#WorkspaceOperations) recompute
+ * to conclude "not here").
+ *
+ * Invalidation is structural, not time-based: every SWM write for an op flows
+ * through `storeWorkspaceOperationPublicQuads`, which `deleteByPattern`s the whole
+ * op subject before rewriting it (workspace-resolution.ts) — so any content change
+ * (own share OR gossip-receive) drops the stamp and the op re-enters the recompute
+ * lane. `verifyMerkleMatch` stays authoritative on the fast path, so a stale stamp
+ * can only ever cause a *missed* promotion (recovered on the next write, and
+ * self-healed on a verify-fail), never a wrong one.
+ *
+ * Deliberately invisible to the sibling VM-reconcile negative cache: its
+ * `readVmReconcileSwmGen` / `vmReconcileWorkspaceOperationPattern` fingerprints
+ * select only `rootEntity`/`publishedAt` on the op subject (plus the separate data
+ * graph), so stamping this predicate into the meta graph does not perturb the
+ * generation signal the negative cache keys on — the two mechanisms don't fight.
+ */
+export const SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE = `${DKG_NS}snapshotMerkleRoot`;
+
+/**
  * Resolves a local context-graph id (the topic/CG name used in gossip) to
  * its on-chain numeric id. Returns `null`/`undefined` for CGs that aren't
  * registered on-chain. Used as a fallback when a peer-finalization gossip
@@ -1051,10 +1076,13 @@ export class FinalizationHandler {
    * KA belongs to a publish this node never shared. Either way the B.2 sweep
    * retries later.
    *
-   * Cost note: O(#WorkspaceOperations) root recomputations per call. Fine for
-   * typical CGs; if a CG grows large this can be optimised by stamping the KC
-   * merkle root onto SWM meta at publish time (a publisher-side change, out of
-   * scope here).
+   * Cost note (#1609): the recompute is memoized — the first time an op's root is
+   * computed it is stamped onto the op subject (`SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE`),
+   * so later lookups resolve the matching op by root directly and the dominant
+   * absent-KA case (target not local) returns without touching any op's SWM quads.
+   * Only un-stamped ops (new / legacy / content-invalidated) fall back to the
+   * recompute scan. The generated-catalog-floor variant keeps the exhaustive scan
+   * (its match is over quads+floor, not the op's intrinsic stamped root).
    */
   private async findSwmSnapshotForMerkleRoot(
     contextGraphId: string,
@@ -1120,13 +1148,32 @@ export class FinalizationHandler {
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
       : contextGraphWorkspaceMetaGraphUri(contextGraphId);
 
+    // The generated-catalog-floor variant matches over quads+floor rather than an
+    // op's intrinsic root, so it cannot be resolved by the stamped intrinsic root —
+    // those CGs (a stable per-CG access policy) keep the exhaustive recompute scan.
+    const useStampIndex = !allowGeneratedCatalogFloor;
+
+    // FAST PATH — resolve the op whose stamped root equals the target directly,
+    // instead of recomputing every op's root. A miss (target not local) returns
+    // after one indexed read without touching any op's SWM quads.
+    if (useStampIndex) {
+      const stamped = await this.findStampedSwmSnapshot(contextGraphId, wsMetaGraph, merkleRoot, subGraphName);
+      if (stamped) return stamped;
+    }
+
     // Group root entities by their WorkspaceOperation so each candidate KC is
-    // verified as a whole (the merkle root is over all of an op's roots).
+    // verified as a whole (the merkle root is over all of an op's roots). With the
+    // stamp index live, only scan ops that don't yet carry a stamp (new / legacy /
+    // just-invalidated) — stamped ops were already resolved or ruled out above.
     const rootsByOp = new Map<string, string[]>();
     try {
+      const unstampedFilter = useStampIndex
+        ? `FILTER NOT EXISTS { ?op <${SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE}> ?stamp . }`
+        : '';
       const result = await this.store.query(`SELECT ?op ?root WHERE {
         GRAPH <${assertSafeIri(wsMetaGraph)}> {
           ?op <${DKG_NS}rootEntity> ?root .
+          ${unstampedFilter}
         }
       }`);
       if (result.type === 'bindings') {
@@ -1146,20 +1193,92 @@ export class FinalizationHandler {
     const opsSorted = [...rootsByOp.entries()].sort(
       ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
     );
-    for (const [, roots] of opsSorted) {
+    // Memoize the intrinsic root of every op we recompute this pass (hit or miss),
+    // so the next lookup for any of these roots — including the dominant absent-KA
+    // miss — is served by the fast path. Best-effort: a store hiccup on the memo
+    // write must never fail reconcile (correctness comes from the recompute here).
+    const stamps: Quad[] = [];
+    const targetHex = ethers.hexlify(merkleRoot);
+    let hit: { rootEntities: string[]; sharedMemoryQuads: Quad[] } | null = null;
+    for (const [op, roots] of opsSorted) {
       const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, roots, subGraphName);
       if (sharedMemoryQuads.length === 0) continue;
       const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, roots, subGraphName);
-      const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
-        contextGraphId,
-        sharedMemoryQuads,
-        privateRoots,
-        merkleRoot,
-        allowGeneratedCatalogFloor,
-      );
-      if (merkleMatchedQuads) {
-        return { rootEntities: roots, sharedMemoryQuads: merkleMatchedQuads };
+      if (useStampIndex) {
+        const computedHex = ethers.hexlify(computeFlatKCRoot(sharedMemoryQuads, privateRoots));
+        stamps.push({ subject: op, predicate: SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE, object: `"${computedHex}"`, graph: wsMetaGraph });
+        if (computedHex === targetHex) {
+          hit = { rootEntities: roots, sharedMemoryQuads };
+          break;
+        }
+      } else {
+        const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
+          contextGraphId,
+          sharedMemoryQuads,
+          privateRoots,
+          merkleRoot,
+          allowGeneratedCatalogFloor,
+        );
+        if (merkleMatchedQuads) {
+          return { rootEntities: roots, sharedMemoryQuads: merkleMatchedQuads };
+        }
       }
+    }
+    if (stamps.length > 0) {
+      try { await this.store.insert(stamps); }
+      catch { /* memo is best-effort; the recompute above is the source of truth */ }
+    }
+    return hit;
+  }
+
+  /**
+   * Fast path for `findSwmSnapshotInNamespace`: resolve the WorkspaceOperation
+   * whose stamped intrinsic root equals `merkleRoot` without recomputing every
+   * op's root. Re-verifies with `verifyMerkleMatch` (authoritative) so a stale
+   * stamp can never promote the wrong snapshot; a stamp that no longer verifies is
+   * dropped so the op falls back into the recompute scan this same pass.
+   */
+  private async findStampedSwmSnapshot(
+    contextGraphId: string,
+    wsMetaGraph: string,
+    merkleRoot: Uint8Array,
+    subGraphName?: string,
+  ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[] } | null> {
+    const targetHex = ethers.hexlify(merkleRoot);
+    const rootsByOp = new Map<string, string[]>();
+    try {
+      const result = await this.store.query(`SELECT ?op ?root WHERE {
+        GRAPH <${assertSafeIri(wsMetaGraph)}> {
+          ?op <${SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE}> "${targetHex}" .
+          ?op <${DKG_NS}rootEntity> ?root .
+        }
+      }`);
+      if (result.type === 'bindings') {
+        for (const row of result.bindings) {
+          const op = typeof row['op'] === 'string' ? row['op'].replace(/^<(.*)>$/, '$1') : '';
+          const root = typeof row['root'] === 'string' ? row['root'].replace(/^<(.*)>$/, '$1') : '';
+          if (!op || !isSafeIri(root)) continue;
+          const list = rootsByOp.get(op) ?? [];
+          list.push(root);
+          rootsByOp.set(op, list);
+        }
+      }
+    } catch { return null; }
+
+    for (const [op, roots] of rootsByOp) {
+      const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, roots, subGraphName);
+      if (sharedMemoryQuads.length > 0) {
+        const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, roots, subGraphName);
+        if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, merkleRoot)) {
+          return { rootEntities: roots, sharedMemoryQuads };
+        }
+      }
+      // The stamp no longer reflects the op's content (a content write should have
+      // already cleared it — clear defensively) so the recompute scan re-evaluates
+      // and re-stamps it with its real root this pass.
+      try {
+        await this.store.deleteByPattern({ graph: wsMetaGraph, subject: op, predicate: SWM_SNAPSHOT_MERKLE_ROOT_PREDICATE });
+      } catch { /* best-effort self-heal */ }
     }
     return null;
   }
