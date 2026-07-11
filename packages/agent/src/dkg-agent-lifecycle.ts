@@ -5287,6 +5287,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
       const persistedRows = await store.loadAll();
       const rows = persistedRows.filter((r) => !systemContextGraphs.has(r.id));
+      const startupSyncGraphs = new Set(this.config.syncContextGraphs ?? []);
       // Cap how many subscriptions we ACTIVATE on boot. Activation
       // (in-memory restore + sync-track + gossip subscribe + member persist)
       // does store-touching work per row; a large stale backlog fans this out
@@ -5335,12 +5336,19 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       const dormantRows = cap > 0 ? userRows.slice(cap) : [];
       for (let i = 0; i < toActivate.length; i++) {
         const row = toActivate[i];
+        // A configured remote graph may carry the false-public bootstrap state
+        // persisted by older daemons. Re-confirm curator metadata after restart
+        // instead of trusting that stale metaSynced bit.
+        const configuredRemoteRow = row.coreHosted !== true && startupSyncGraphs.has(row.id);
+        const rehydratedMetaState = configuredRemoteRow
+          ? { metaSynced: false, pendingMeta: true }
+          : { metaSynced: row.metaSynced };
         this.setContextGraphSubscription(row.id, {
           name: row.name,
           subscribed: row.subscribed,
           synced: row.synced,
           sharedMemorySynced: row.sharedMemorySynced,
-          metaSynced: row.metaSynced,
+          ...rehydratedMetaState,
           onChainId: row.onChainId,
           onChainHash: row.onChainHash,
           lastReconciledOrdinal: row.lastReconciledOrdinal,
@@ -5353,7 +5361,11 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           this.trackSyncContextGraph(row.id);
         }
         if (row.subscribed) {
-          this.subscribeToContextGraph(row.id, { trackSyncScope: false, persist: false });
+          this.subscribeToContextGraph(row.id, {
+            trackSyncScope: false,
+            persist: false,
+            deferSharedMemoryGossipSubscribe: configuredRemoteRow,
+          });
           this.persistLocalNodeMembership(row.id, 'rehydrated-subscription');
         }
         // Throttle: yield so concurrent store-backed work (routes, sync) can
@@ -5540,11 +5552,23 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     }
 
     const metaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const awaitingRemoteMeta = this.subscribedContextGraphs.get(contextGraphId)?.pendingMeta === true;
+    // A historical ensureContextGraphLocal() bootstrap leaves a lone
+    // registrationStatus row in _meta. That row is local bookkeeping, not
+    // proof that the curator's authorization-bearing metadata arrived.
     const metaResult = await this.store.query(
-      `ASK WHERE { GRAPH <${metaGraph}> { ?s ?p ?o } }`,
+      `ASK WHERE {
+        GRAPH <${metaGraph}> {
+          ?s ?p ?o .
+          FILTER(?p != <${DKG_ONTOLOGY.DKG_REGISTRATION_STATUS}>)
+        }
+      }`,
     );
     if (metaResult.type === 'boolean' && metaResult.value === true) {
       return true;
+    }
+    if (awaitingRemoteMeta) {
+      return false;
     }
 
     // Ontology-only fallback: a CG declared `rdf:type dkg:ContextGraph` can be

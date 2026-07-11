@@ -917,6 +917,86 @@ export async function validateStartupGenesis(
   return { ok: true, networkId };
 }
 
+export interface StartupContextGraphAgent {
+  ensureContextGraphLocal(options: {
+    id: string;
+    name: string;
+    description?: string;
+  }): Promise<void>;
+  subscribeToContextGraph(
+    contextGraphId: string,
+    options?: { deferSharedMemoryGossipSubscribe?: boolean },
+  ): void;
+  markContextGraphSubscriptionState(
+    contextGraphId: string,
+    patch: { name?: string; metaSynced?: boolean; pendingMeta?: boolean },
+  ): void;
+  hasConfirmedMetaState(contextGraphId: string): Promise<boolean>;
+}
+
+/**
+ * Install daemon startup subscriptions without fabricating an existing remote
+ * configured graph as a local public graph. Network defaults retain the
+ * historical ensure-local behavior.
+ */
+export async function initializeStartupContextGraphs(input: {
+  agent: StartupContextGraphAgent;
+  syncContextGraphs: readonly string[];
+  configuredContextGraphs: readonly string[];
+  log: (message: string) => void;
+}): Promise<void> {
+  const configuredContextGraphs = new Set(input.configuredContextGraphs);
+
+  for (const contextGraphId of new Set(input.syncContextGraphs)) {
+    if (configuredContextGraphs.has(contextGraphId)) {
+      input.agent.subscribeToContextGraph(contextGraphId, {
+        deferSharedMemoryGossipSubscribe: true,
+      });
+      // Set the fail-safe state before checking the store. Older startup code
+      // may have persisted metaSynced=true beside only a registration row and
+      // public ontology placeholder; pending state prevents that placeholder
+      // from confirming itself.
+      input.agent.markContextGraphSubscriptionState(contextGraphId, {
+        name: contextGraphId,
+        metaSynced: false,
+        pendingMeta: true,
+      });
+      const hasConfirmedMeta = await input.agent
+        .hasConfirmedMetaState(contextGraphId)
+        .catch(() => false);
+      if (hasConfirmedMeta) {
+        input.agent.markContextGraphSubscriptionState(contextGraphId, {
+          name: contextGraphId,
+          metaSynced: true,
+          pendingMeta: false,
+        });
+        // The first subscribe intentionally deferred SWM gossip. Re-enter the
+        // idempotent non-deferred path now that authorization metadata is real
+        // so an already-synced configured graph is not stranded off its topic.
+        input.agent.subscribeToContextGraph(contextGraphId);
+        input.log(`Subscribed configured context graph: ${contextGraphId} (metadata already confirmed)`);
+      } else {
+        input.log(`Subscribed configured context graph: ${contextGraphId} (awaiting remote metadata)`);
+      }
+      continue;
+    }
+
+    try {
+      await input.agent.ensureContextGraphLocal({
+        id: contextGraphId,
+        name: contextGraphId,
+        description: `Default context graph: ${contextGraphId}`,
+      });
+      input.log(`Ensured context graph: ${contextGraphId}`);
+    } catch (err) {
+      input.log(
+        `Context graph "${contextGraphId}" setup failed: ${err instanceof Error ? err.message : String(err)} — will discover via sync/gossip`,
+      );
+      input.agent.subscribeToContextGraph(contextGraphId);
+    }
+  }
+}
+
 export async function runDaemon(foreground: boolean): Promise<void> {
   await ensureDkgDir();
   const config = await loadConfig();
@@ -1121,9 +1201,10 @@ export async function runDaemonInner(
     for (const message of genesisValidation.messages) log(message);
     process.exit(1);
   }
+  const configuredContextGraphs = resolveContextGraphs(config);
   const syncContextGraphs = [
     ...new Set([
-      ...resolveContextGraphs(config),
+      ...configuredContextGraphs,
       ...resolveNetworkDefaultContextGraphs(network),
     ]),
   ];
@@ -2040,25 +2121,12 @@ export async function runDaemonInner(
   }, 0);
   if (relayRegistryTimer.unref) relayRegistryTimer.unref();
 
-  // Ensure configured context graphs + network defaults are subscribed and available.
-  // Uses ensureContextGraphLocal (idempotent) to avoid duplicate creator claims
-  // and to survive "already exists" gracefully.
-  const contextGraphsToSubscribe = new Set(syncContextGraphs);
-  for (const p of contextGraphsToSubscribe) {
-    try {
-      await agent.ensureContextGraphLocal({
-        id: p,
-        name: p,
-        description: `Default context graph: ${p}`,
-      });
-      log(`Ensured context graph: ${p}`);
-    } catch (err) {
-      log(
-        `Context graph "${p}" setup failed: ${err instanceof Error ? err.message : String(err)} — will discover via sync/gossip`,
-      );
-      agent.subscribeToContextGraph(p);
-    }
-  }
+  await initializeStartupContextGraphs({
+    agent,
+    syncContextGraphs,
+    configuredContextGraphs,
+    log,
+  });
 
   // Run an initial chain scan for context graphs we might not know about,
   // then repeat every 30 minutes as a fallback discovery mechanism.

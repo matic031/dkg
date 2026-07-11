@@ -909,26 +909,33 @@ async function readSwmMetaRows(
   cutoffIso: string | null,
   signal?: AbortSignal,
 ): Promise<SyncRow[]> {
-  const swmMetaValues = graphValues(swmMetaGraphs);
-  if (!swmMetaValues) return [];
-  const res = await store.query(`
-    SELECT DISTINCT ?g ?s ?p ?o WHERE {
-      VALUES ?g { ${swmMetaValues} }
-      GRAPH ?g {
-        ?s ?p ?o .
-        ${cutoffIso
-    ? `
-        ?s <${DKG_PUBLISHED_AT}> ?ts .
-        FILTER(?ts >= ${sparqlString(cutoffIso)}^^<http://www.w3.org/2001/XMLSchema#dateTime>)`
-    : ''}
+  const rows: SyncRow[] = [];
+  // Oxigraph answers explicit named-graph queries quickly. The previous
+  // `VALUES ?g` / `GRAPH ?g` self-join could spend minutes materialising a
+  // large shared-memory metadata snapshot before serving page one.
+  for (const graph of swmMetaGraphs) {
+    const res = await store.query(`
+      SELECT ?s ?p ?o WHERE {
+        GRAPH <${assertSafeIri(graph)}> {
+          ?s ?p ?o .
+          ${cutoffIso
+            ? `FILTER EXISTS {
+            ?s <${DKG_PUBLISHED_AT}> ?ts .
+            FILTER(?ts >= ${sparqlString(cutoffIso)}^^<http://www.w3.org/2001/XMLSchema#dateTime>)
+          }`
+            : ''}
+        }
       }
+    `, syncResponderStoreOptions(signal, 'sync.responder.readSwmMetaRows'));
+    if (res.type !== 'bindings') continue;
+    for (const row of res.bindings) {
+      const s = row['s'];
+      const p = row['p'];
+      const o = row['o'];
+      if (s && p && o) rows.push({ s, p, o, g: graph });
     }
-  `, syncResponderStoreOptions(signal, 'sync.responder.readSwmMetaRows'));
-  if (res.type !== 'bindings') return [];
-  return res.bindings
-    .map((row) => ({ s: row['s'], p: row['p'], o: row['o'], g: row['g'] }))
-    .filter((row) => row.s && row.p && row.o && row.g)
-    .sort(compareRows);
+  }
+  return rows.sort(compareRows);
 }
 
 async function readSwmMetaRowsPage(

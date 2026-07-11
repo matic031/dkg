@@ -1063,12 +1063,14 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     // via invite), we can't determine the access policy. Send an
     // authenticated request so the remote peer can verify our identity
     // against its allowlist.
-    const hasLocalData = this.subscribedContextGraphs.get(contextGraphId)?.synced === true;
+    const subscription = this.subscribedContextGraphs.get(contextGraphId);
+    const hasLocalData = subscription?.synced === true;
+    const awaitingRemoteMeta = subscription?.pendingMeta === true;
     // the catalog facet is public and served without the
     // allowlist gate, so an outsider (no CG identity) requests it unauthenticated.
     // R9: recovery serves plaintext member-to-member and is gated by the strict
     // members-only authorizer — it MUST be an authenticated (signed) envelope.
-    const needsAuth = recovery || (phase !== 'catalog' && (isPrivate || !hasLocalData));
+    const needsAuth = recovery || (phase !== 'catalog' && (isPrivate || !hasLocalData || awaitingRemoteMeta));
     const claimedAgentAddress = await this.findLocalAgentForContextGraph(contextGraphId);
     const claimedAgent = claimedAgentAddress ? this.localAgents.get(claimedAgentAddress) : undefined;
     return buildSyncRequestEnvelope({

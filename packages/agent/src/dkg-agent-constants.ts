@@ -15,9 +15,15 @@ export const PRIVATE_DATA_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
 // ── Sync ──────────────────────────────────────────────────────────────
 export const SYNC_PAGE_SIZE = 500;
 export const SYNC_PAGE_RETRY_ATTEMPTS = 3;
-export const SYNC_TOTAL_TIMEOUT_MS = 120_000;
+
+function positiveEnvMs(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? '');
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+export const SYNC_TOTAL_TIMEOUT_MS = positiveEnvMs('DKG_SYNC_TOTAL_TIMEOUT_MS', 120_000);
 /** Per-page timeout for sync when we have budget (relay links can be slow). */
-export const SYNC_PAGE_TIMEOUT_MS = 45_000;
+export const SYNC_PAGE_TIMEOUT_MS = positiveEnvMs('DKG_SYNC_PAGE_TIMEOUT_MS', 45_000);
 /** ProtocolRouter.send retries internally 3 times with the same timeout; cap so 3× fits in remaining budget. */
 export const SYNC_ROUTER_ATTEMPTS = 3;
 export const SYNC_PROTOCOL_CHECK_ATTEMPTS = 3;
@@ -90,7 +96,7 @@ export const MAX_CONTEXT_GRAPH_PARTICIPANT_AGENTS = 256;
 
 // ── Refresh / SWM lifecycle ───────────────────────────────────────────
 export const META_REFRESH_COOLDOWN_MS = 30_000;
-export const SYNC_MIN_GRAPH_BUDGET_MS = 10_000;
+export const SYNC_MIN_GRAPH_BUDGET_MS = positiveEnvMs('DKG_SYNC_MIN_GRAPH_BUDGET_MS', 10_000);
 export const DEBUG_SYNC_PROGRESS = process.env.DKG_DEBUG_SYNC_PROGRESS === '1';
 export const DEFAULT_SWM_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const SWM_CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // run cleanup every 15 minutes
