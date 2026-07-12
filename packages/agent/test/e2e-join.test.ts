@@ -65,6 +65,7 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
   let joiner: DKGAgent; // hosts the requesting agents
   let approvedAddr: string;
   let rejectedAddr: string;
+  let existingAddr: string;
 
   afterAll(async () => {
     try { await curator?.stop(); } catch { /* ignore */ }
@@ -104,10 +105,13 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
     // signing key so signJoinRequest can produce a real SignedAgentDelegation).
     const recApprove = await joiner.registerAgent('joiner-approve', { framework: 'test' });
     const recReject = await joiner.registerAgent('joiner-reject', { framework: 'test' });
+    const recExisting = await joiner.registerAgent('joiner-existing', { framework: 'test' });
     approvedAddr = recApprove.agentAddress;
     rejectedAddr = recReject.agentAddress;
+    existingAddr = recExisting.agentAddress;
     expect(approvedAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
     expect(rejectedAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(existingAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
   }, 25_000);
 
   it('the curator owns a CURATED context graph (join-gated)', async () => {
@@ -139,6 +143,22 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
       (s) => s === 'approved',
     );
     expect(status, 'approval did not reach the requester node over P2P').toBe('approved');
+  }, 30_000);
+
+  it('already-member refreshes the signed peer/key delegation before notifying', async () => {
+    // Reproduce a curator that knows the wallet (for example via add-agent)
+    // but has no delegation for this freshly installed node yet.
+    await curator.inviteAgentToContextGraph(CG, existingAddr);
+
+    const delegation = await joiner.signJoinRequest(CG, existingAddr);
+    const result = await joiner.forwardJoinRequest(CG, delegation, 'joiner-existing', curator.peerId);
+    expect(result.alreadyMember).toBe(true);
+
+    const peerDelegations = await pollUntil(
+      () => curator.getAllowedDelegateePeers(CG),
+      (rows) => rows.get(existingAddr.toLowerCase())?.includes(joiner.peerId) === true,
+    );
+    expect(peerDelegations.get(existingAddr.toLowerCase())).toContain(joiner.peerId);
   }, 30_000);
 
   it('curator REJECTION is delivered back to the requester node cross-node (status → rejected)', async () => {

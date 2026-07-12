@@ -163,6 +163,7 @@ export interface MessengerDeps {
 export interface SendOpts {
   timeoutMs?: number;
   signal?: AbortSignal;
+  maxAttempts?: number;
 }
 
 export interface SendReliableOpts {

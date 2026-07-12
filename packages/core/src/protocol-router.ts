@@ -66,6 +66,12 @@ export interface SendOptions {
   /** Overall send timeout (resolver + dial + write + read). Default {@link DEFAULT_SEND_TIMEOUT_MS}. */
   timeoutMs?: number;
   /**
+   * Number of one-shot transport attempts using these exact payload bytes.
+   * Defaults to 3. Set to 1 when the payload contains a single-use nonce;
+   * the caller can then rebuild and re-sign fresh bytes before retrying.
+   */
+  maxAttempts?: number;
+  /**
    * Race up to N parallel `newStream` attempts across the peer's live
    * connections (different relay paths where the natural connection
    * list provides them). First successful response wins; loser
@@ -573,6 +579,7 @@ export class ProtocolRouter {
     const opts: SendOptions =
       typeof timeoutMsOrOpts === 'number' ? { timeoutMs: timeoutMsOrOpts } : timeoutMsOrOpts;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
+    const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 3));
     const parallelPaths = Math.max(1, Math.floor(opts.parallelPaths ?? 1));
     const overallStartedAt = Date.now();
     const overallDeadline = AbortSignal.timeout(timeoutMs);
@@ -750,7 +757,7 @@ export class ProtocolRouter {
     // specifically to recover from this case.
     const triedConnections = new WeakSet<ReusableConnection>();
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const remaining = timeoutMs - (Date.now() - startedAt);
       if (remaining <= 0) {
         lastErr = new Error('send timeout elapsed');
@@ -937,7 +944,7 @@ export class ProtocolRouter {
           triedConnections.add(pickedConnection);
         }
         if (attemptSignal.aborted || overallSignal.aborted) throw err;
-        if (!isRecoverableSendError(err) || attempt >= 2) throw err;
+        if (!isRecoverableSendError(err) || attempt >= maxAttempts - 1) throw err;
         const backoff = (attempt + 1) * 500;
         // Make the backoff abortable so the overall deadline is
         // honored. Codex PR #560 round-5 caught: if the pool burned

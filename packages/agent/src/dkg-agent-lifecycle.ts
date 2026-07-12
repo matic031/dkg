@@ -2282,9 +2282,25 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         const addrLower = delegation.agentAddress.toLowerCase();
         const alreadyMember = allowed.some((a) => a.toLowerCase() === addrLower);
         if (alreadyMember) {
+          // Being present in the bare agent allowlist is not enough for an
+          // edge node to pass private-sync auth. Persist the freshly verified
+          // delegation too, so the requester wallet is bound to its current
+          // libp2p peer / operational key before we send join-approved.
+          //
+          // This matters after a curator used add-agent (or restored an old
+          // allowlist) and the member then installs a fresh node. The old
+          // shortcut notified success without refreshing this binding; the
+          // requester consequently received join-approved but every _meta
+          // request was denied, leaving both VM and SWM permanently at zero.
+          await this.inviteAgentToContextGraph(
+            contextGraphId,
+            delegation.agentAddress,
+            undefined,
+            delegation,
+          );
           this.log.info(
             requestCtx,
-            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": already-member short-circuit for ${delegation.agentAddress}`,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": already-member delegation refreshed for ${delegation.agentAddress}`,
           );
           this.notifyJoinApproval(contextGraphId, delegation.agentAddress).catch(() => {});
           return new TextEncoder().encode(JSON.stringify({ ok: true, alreadyMember: true }));
@@ -3937,7 +3953,15 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       // adapter — harmless, left in place to keep the transport surface
       // stable (reverts rc.9 PR-E for sync only).
       send: async (peerId, protocolId, data, sendTimeoutMs, _messageId, sendSignal) =>
-        this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs, signal: sendSignal }),
+        this.messenger.sendToPeer(peerId, protocolId, data, {
+          timeoutMs: sendTimeoutMs,
+          signal: sendSignal,
+          // The authenticated sync envelope carries a single-use requestId.
+          // Let sync-transport own retries so requestFactory can rebuild and
+          // re-sign fresh bytes for every attempt; ProtocolRouter's normal
+          // internal retries would otherwise replay the same requestId.
+          maxAttempts: 1,
+        }),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),

@@ -871,6 +871,30 @@ describe('ProtocolRouter', () => {
       expect(dialCalls).toBe(1);
       expect(resolveCalls).toBe(1);
     });
+
+    it('honors maxAttempts=1 for payloads with single-use nonces', async () => {
+      let resolveCalls = 0;
+      let dialCalls = 0;
+      const router = makeRouter({
+        onResolve: () => { resolveCalls += 1; },
+        dialBehavior: async () => {
+          dialCalls += 1;
+          throw new Error('The stream has been reset');
+        },
+      });
+
+      await expect(
+        router.send(
+          FAKE_PEER_ID,
+          '/dkg/10.0.2/sync',
+          new Uint8Array([1]),
+          { maxAttempts: 1 },
+        ),
+      ).rejects.toThrow(/reset/);
+
+      expect(dialCalls).toBe(1);
+      expect(resolveCalls).toBe(1);
+    });
   });
 
   // PR 5 — "Window D" fast path. Before dialProtocol, send() checks

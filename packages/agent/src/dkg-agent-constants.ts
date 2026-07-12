@@ -24,8 +24,8 @@ function positiveEnvMs(name: string, fallback: number): number {
 export const SYNC_TOTAL_TIMEOUT_MS = positiveEnvMs('DKG_SYNC_TOTAL_TIMEOUT_MS', 120_000);
 /** Per-page timeout for sync when we have budget (relay links can be slow). */
 export const SYNC_PAGE_TIMEOUT_MS = positiveEnvMs('DKG_SYNC_PAGE_TIMEOUT_MS', 45_000);
-/** ProtocolRouter.send retries internally 3 times with the same timeout; cap so 3× fits in remaining budget. */
-export const SYNC_ROUTER_ATTEMPTS = 3;
+/** Sync disables ProtocolRouter's same-payload retries so every retry gets a fresh signed requestId. */
+export const SYNC_ROUTER_ATTEMPTS = 1;
 export const SYNC_PROTOCOL_CHECK_ATTEMPTS = 3;
 export const SYNC_PROTOCOL_CHECK_DELAY_MS = 500;
 export const SYNC_AUTH_MAX_AGE_MS = 90_000;
