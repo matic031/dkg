@@ -433,6 +433,64 @@ type ContextGraphCatchupResult = Awaited<ReturnType<DKGAgent['runCatchupOverPeer
 
 const inFlightSyncPageFetchesByAgent = new WeakMap<DKGAgent, Map<string, InFlightSyncPageFetch>>();
 const inFlightSyncSingleFlightsByAgent = new WeakMap<DKGAgent, Map<string, Promise<unknown>>>();
+const privateSwmRecoveryRetryTimersByAgent = new WeakMap<DKGAgent, Map<string, ReturnType<typeof setTimeout>>>();
+const PRIVATE_SWM_RECOVERY_RETRY_MS = 5_000;
+
+function privateSwmRecoveryRetryTimersFor(agent: DKGAgent): Map<string, ReturnType<typeof setTimeout>> {
+  let timers = privateSwmRecoveryRetryTimersByAgent.get(agent);
+  if (!timers) {
+    timers = new Map();
+    privateSwmRecoveryRetryTimersByAgent.set(agent, timers);
+  }
+  return timers;
+}
+
+function clearPrivateSwmRecoveryRetry(
+  agent: DKGAgent,
+  remotePeerId: string,
+  contextGraphId: string,
+): void {
+  const key = `${remotePeerId}\n${contextGraphId}`;
+  const timers = privateSwmRecoveryRetryTimersFor(agent);
+  const timer = timers.get(key);
+  if (timer) clearTimeout(timer);
+  timers.delete(key);
+}
+
+function schedulePrivateSwmRecoveryRetry(
+  agent: DKGAgent,
+  remotePeerId: string,
+  contextGraphId: string,
+  callbacks: {
+    isStarted: () => boolean;
+    retry: () => Promise<RecoverContextGraphSwmResult>;
+    logInfo: (ctx: OperationContext, message: string) => void;
+    logWarn: (ctx: OperationContext, message: string) => void;
+  },
+): void {
+  const key = `${remotePeerId}\n${contextGraphId}`;
+  const timers = privateSwmRecoveryRetryTimersFor(agent);
+  if (timers.has(key) || !callbacks.isStarted()) return;
+  const timer = setTimeout(() => {
+    timers.delete(key);
+    if (!callbacks.isStarted()) return;
+    const ctx = createOperationContext('sync');
+    callbacks.logInfo(
+      ctx,
+      `Retrying incomplete SWM recovery for "${contextGraphId}" from curator ${remotePeerId.slice(-8)}`,
+    );
+    callbacks.retry().catch((error: unknown) => {
+      callbacks.logWarn(
+        ctx,
+        `SWM recovery retry for "${contextGraphId}" from curator ${remotePeerId.slice(-8)} failed: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+      schedulePrivateSwmRecoveryRetry(agent, remotePeerId, contextGraphId, callbacks);
+    });
+  }, PRIVATE_SWM_RECOVERY_RETRY_MS);
+  if (timer.unref) timer.unref();
+  timers.set(key, timer);
+}
 
 function syncPageFetchCoalescingKey(params: {
   remotePeerId: string;
@@ -4279,7 +4337,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.log.warn(ctx, `Skipping SWM recovery from ${remotePeerId.slice(-8)} (DKG_DURABLE_SYNC_ENABLED=0)`);
       return emptySwmRecoveryResult();
     }
-    return runSyncSingleFlight(
+    const result = await runSyncSingleFlight(
       this,
       privateSwmRecoverySingleFlightKey(remotePeerId, contextGraphId),
       () => withGlobalSyncBackpressure(
@@ -4317,6 +4375,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         ),
       ),
     );
+    if (result.completed) {
+      clearPrivateSwmRecoveryRetry(this, remotePeerId, contextGraphId);
+    } else {
+      schedulePrivateSwmRecoveryRetry(this, remotePeerId, contextGraphId, {
+        isStarted: () => this.started,
+        retry: () => this.recoverContextGraphSwmFromPeer(remotePeerId, contextGraphId),
+        logInfo: (ctx, message) => this.log.info(ctx, message),
+        logWarn: (ctx, message) => this.log.warn(ctx, message),
+      });
+    }
+    return result;
   }
 
   createContextGraphSyncDeadline(this: DKGAgent, remainingContextGraphs: number): number {

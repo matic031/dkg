@@ -247,7 +247,9 @@ describe('DKGAgent sync fetch coalescing', () => {
 
       response.resolve(new Uint8Array(0));
       await expect(first).resolves.toMatchObject({ quads: [] });
-      expect(sends).toBe(1);
+      // One shared page fetch, followed by the same-offset empty EOF
+      // confirmation. The aborted waiter must not add a third send.
+      expect(sends).toBe(2);
     } finally {
       await agent.stop().catch(() => {});
     }

@@ -1737,8 +1737,8 @@ describe('DKGAgent sync transport — off the messenger substrate (node-ui.db bl
       );
 
       expect(result.quads).toEqual([]);
-      expect(sendToPeer.calls).toHaveLength(1);
-      expect(sendToPeer.calls[0][1]).toBe(PROTOCOL_SYNC);
+      expect(sendToPeer.calls).toHaveLength(2);
+      expect(sendToPeer.calls.every((call) => call[1] === PROTOCOL_SYNC)).toBe(true);
       expect(sendReliable.calls).toEqual([]);
     } finally {
       await agent.stop().catch(() => {});
