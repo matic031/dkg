@@ -6,7 +6,7 @@
  * `join_approved` / `join_rejected` decision is delivered from the curator
  * to the REQUESTER'S node over a real P2P stream (PROTOCOL_JOIN_REQUEST /
  * the join-decision return path), and only on that delivery does the
- * requester's `getJoinRequestStatus` flip to approved/rejected. A
+ * requester's public event stream emits approved/rejected. A
  * same-node requester short-circuits to `delivered:'local'` and never
  * exercises the cross-node decision delivery (see notifications-route
  * test, which documents this as devnet-tier).
@@ -168,13 +168,17 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
     ).toBe(true);
   }, 30_000);
 
-  it('curator APPROVAL is delivered back to the requester node cross-node (status → approved)', async () => {
+  it('curator APPROVAL is delivered back to the requester node cross-node', async () => {
+    const delivered = new Promise<{ contextGraphId: string; agentAddress: string }>((resolve) => {
+      joiner.eventBus.once('join:approved', (data) => {
+        resolve(data as { contextGraphId: string; agentAddress: string });
+      });
+    });
     await curator.approveJoinRequest(CG, approvedAddr);
-    const status = await pollUntil(
-      () => joiner.getJoinRequestStatus(CG, approvedAddr),
-      (s) => s === 'approved',
-    );
-    expect(status, 'approval did not reach the requester node over P2P').toBe('approved');
+    await expect(delivered).resolves.toEqual({
+      contextGraphId: CG,
+      agentAddress: approvedAddr,
+    });
   }, 30_000);
 
   it('already-member refreshes the signed peer/key delegation before notifying', async () => {
@@ -187,13 +191,13 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
     expect(result.alreadyMember).toBe(true);
 
     const peerDelegations = await pollUntil(
-      () => curator.getAllowedDelegateePeers(CG),
+      () => curator.getContextGraphAllowedDelegateePeers(CG),
       (rows) => rows.get(existingAddr.toLowerCase())?.includes(joiner.peerId) === true,
     );
     expect(peerDelegations.get(existingAddr.toLowerCase())).toContain(joiner.peerId);
   }, 30_000);
 
-  it('curator REJECTION is delivered back to the requester node cross-node (status → rejected)', async () => {
+  it('curator REJECTION is delivered back to the requester node cross-node', async () => {
     // Second agent forwards a request, curator rejects it, and the rejection
     // must reach the requester node the same way an approval does.
     const delegation = await joiner.signJoinRequest(CG, rejectedAddr);
@@ -205,11 +209,15 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
       (rows) => rows.some((r: any) => String(r.agentAddress).toLowerCase() === rejectedAddr.toLowerCase()),
     );
 
+    const delivered = new Promise<{ contextGraphId: string; agentAddress: string }>((resolve) => {
+      joiner.eventBus.once('join:rejected', (data) => {
+        resolve(data as { contextGraphId: string; agentAddress: string });
+      });
+    });
     await curator.rejectJoinRequest(CG, rejectedAddr);
-    const status = await pollUntil(
-      () => joiner.getJoinRequestStatus(CG, rejectedAddr),
-      (s) => s === 'rejected',
-    );
-    expect(status, 'rejection did not reach the requester node over P2P').toBe('rejected');
+    await expect(delivered).resolves.toEqual({
+      contextGraphId: CG,
+      agentAddress: rejectedAddr,
+    });
   }, 30_000);
 });
