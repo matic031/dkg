@@ -39,6 +39,15 @@ function workspaceOperationMeta(graph: string, op: string, root: string, publish
   ];
 }
 
+function publicSliceMeta(graph: string, slice: string, root: string, publisherPeerId: string): Quad[] {
+  return [
+    { graph, subject: slice, predicate: `${DKG}publishedAt`, object: '"2030-01-01T00:00:00.000Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>' },
+    { graph, subject: slice, predicate: `${DKG}publicSliceRootEntity`, object: root },
+    { graph, subject: slice, predicate: `${DKG}publicQuadsDigest`, object: '"sha256:test-slice"' },
+    { graph, subject: slice, predicate: `${DKG}publisherPeerId`, object: `"${publisherPeerId}"` },
+  ];
+}
+
 function subGraphRegistrationMeta(name: string): Quad[] {
   const subject = `did:dkg:context-graph:${CG_ID}/${name}`;
   return [
@@ -70,6 +79,35 @@ async function registeredSubGraphNamesFromStore(store: OxigraphStore, contextGra
 }
 
 describe('runSharedMemorySync ownership hydration', () => {
+  it('accepts compact public-slice metadata as an SWM root carrier', async () => {
+    const worker = new SyncVerifyWorker();
+    const child = `${ROOT_ENTITY}/.well-known/genid/child`;
+    const dataQuads: Quad[] = [
+      { graph: ROOT_GRAPH, subject: ROOT_ENTITY, predicate: SCHEMA_NAME, object: '"root"' },
+      { graph: ROOT_GRAPH, subject: child, predicate: SCHEMA_NAME, object: '"child"' },
+    ];
+    const metaQuads = publicSliceMeta(
+      ROOT_META_GRAPH,
+      'urn:dkg:public-stage:test-slice',
+      ROOT_ENTITY,
+      'peer-public-slice',
+    );
+
+    try {
+      const processed = await worker.processSharedMemoryBatch(dataQuads, metaQuads, CG_ID);
+
+      expect(processed.verifiedData).toEqual(dataQuads);
+      expect(processed.droppedDataTriples).toBe(0);
+      expect(processed.entityCreators).toEqual([{
+        dataGraph: ROOT_GRAPH,
+        entity: ROOT_ENTITY,
+        creator: 'peer-public-slice',
+      }]);
+    } finally {
+      await worker.close();
+    }
+  });
+
   it('hydrates root and sub-graph SWM ownership under separate keys', async () => {
     const ownedMaps = new Map<string, Map<string, string>>();
     const inserted: Quad[] = [];

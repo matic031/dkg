@@ -202,7 +202,7 @@ export async function runSharedMemorySync(context: SharedMemorySyncContext): Pro
         }
       };
       if (dropped > 0) {
-        logWarn(ctx, `SWM sync dropped ${dropped} triples with invalid subjects (not in meta rootEntity or skolemized child)`);
+        logWarn(ctx, `SWM sync dropped ${dropped} triples with invalid subjects (not in meta rootEntity/publicSliceRootEntity or skolemized child)`);
         summary.droppedDataTriples += dropped;
       }
 

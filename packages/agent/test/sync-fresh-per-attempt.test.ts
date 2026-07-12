@@ -705,6 +705,86 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     expect(first.checkpointKey).toBe(checkpointKey);
   });
 
+  it('returns and checkpoints normal SWM progress when a later page transport resets', async () => {
+    const contextGraphId = 'normal-swm-transport-resume-cg';
+    const checkpointKey = `${REMOTE_PEER_ID}|${contextGraphId}|swm|data`;
+    let checkpointOffset = 0;
+    const observedBuilds: Array<{ offset: number; syncSessionId: string | undefined }> = [];
+    let firstRoundSends = 0;
+
+    const options = (send: () => Promise<Uint8Array>) => ({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId,
+      includeSharedMemory: true,
+      phase: 'data' as const,
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 1,
+      syncPageSize: 1,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => checkpointOffset > 0 ? freshCheckpoint(checkpointOffset) : undefined,
+        set: (_key: string, value: number) => { checkpointOffset = value; },
+        delete: () => { checkpointOffset = 0; },
+      },
+      buildSyncRequest: async (
+        _cg: string,
+        offset: number,
+        _limit: number,
+        _includeSharedMemory: boolean,
+        _remotePeerId: string,
+        _phase: unknown,
+        _snapshotRef: unknown,
+        _sinceBatchId: unknown,
+        syncSessionId?: string,
+      ) => {
+        observedBuilds.push({ offset, syncSessionId });
+        return new TextEncoder().encode(`request-${offset}`);
+      },
+      parseAndFilter: async (nquadsText: string) => nquadsText
+        ? {
+            quads: [{
+              subject: 'urn:normal-swm:subject',
+              predicate: 'urn:normal-swm:predicate',
+              object: '"value"',
+              graph: GRAPH_URI,
+            }],
+            totalQuads: 1,
+          }
+        : { quads: [], totalQuads: 0 },
+      send: async () => send(),
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    const first = await fetchSyncPages(options(async () => {
+      firstRoundSends += 1;
+      if (firstRoundSends === 1) return new TextEncoder().encode('one-quad-line');
+      throw new Error('The stream has been reset');
+    }));
+    expect(first.completed).toBe(false);
+    expect(first.timedOut).toBe(true);
+    expect(first.nextOffset).toBe(1);
+    expect(first.quads).toHaveLength(1);
+    expect(checkpointOffset).toBe(1);
+    const sessionId = observedBuilds[0].syncSessionId;
+
+    const second = await fetchSyncPages(options(async () => new TextEncoder().encode('')));
+    expect(second.completed).toBe(true);
+    expect(second.resumedFromOffset).toBe(1);
+    expect(observedBuilds[observedBuilds.length - 1]).toEqual({
+      offset: 1,
+      syncSessionId: sessionId,
+    });
+    expect(first.checkpointKey).toBe(checkpointKey);
+  });
+
   it('fails closed instead of preserving recovery progress after a malformed later page', async () => {
     const parseError = new Error('malformed recovery N-Quads');
     let sends = 0;

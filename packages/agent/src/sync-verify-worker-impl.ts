@@ -244,6 +244,7 @@ function processSharedMemory(
   excludedSubGraphNames?: readonly string[],
 ): SharedMemoryProcessResult {
   const DKG_ROOT_ENTITY = 'http://dkg.io/ontology/rootEntity';
+  const DKG_PUBLIC_SLICE_ROOT_ENTITY = 'http://dkg.io/ontology/publicSliceRootEntity';
   const DKG_WORKSPACE_OP = 'http://dkg.io/ontology/WorkspaceOperation';
   const DKG_PUBLISHED_AT = 'http://dkg.io/ontology/publishedAt';
   const DKG_PUBLISHER_PEER_ID = 'http://dkg.io/ontology/publisherPeerId';
@@ -270,7 +271,10 @@ function processSharedMemory(
   const opsWithTypeByMeta = new Map<string, Set<string>>();
   const opsWithPublishedAtByMeta = new Map<string, Set<string>>();
   for (const q of wsMetaQuads) {
-    if (q.predicate === RDF_TYPE && q.object === DKG_WORKSPACE_OP) {
+    if (
+      (q.predicate === RDF_TYPE && q.object === DKG_WORKSPACE_OP) ||
+      q.predicate === DKG_PUBLIC_SLICE_ROOT_ENTITY
+    ) {
       let s = opsWithTypeByMeta.get(q.graph);
       if (!s) { s = new Set(); opsWithTypeByMeta.set(q.graph, s); }
       s.add(q.subject);
@@ -282,7 +286,11 @@ function processSharedMemory(
   }
   // (metaGraph → set of op subjects valid in that graph). An op needs
   // BOTH `rdf:type WorkspaceOperation` AND `dkg:publishedAt` in the
-  // SAME meta graph to count.
+  // SAME meta graph to count. New compact public-stage rows have no
+  // `rdf:type WorkspaceOperation`; `dkg:publicSliceRootEntity` is their shape
+  // marker, and they carry the same `publishedAt` + publisher identity fields.
+  // Treat that marker as the type evidence while retaining the same-graph
+  // publishedAt requirement used for legacy WorkspaceOperation rows.
   const validOpsByMeta = new Map<string, Set<string>>();
   const validOps = new Set<string>();
   for (const [metaGraph, typedOps] of opsWithTypeByMeta) {
@@ -298,7 +306,8 @@ function processSharedMemory(
     if (valid.size > 0) validOpsByMeta.set(metaGraph, valid);
   }
 
-  // (dataGraph → set of allowed rootEntities). Derived from each meta
+  // (dataGraph → set of allowed root entities). Read both the legacy
+  // `rootEntity` and compact `publicSliceRootEntity` metadata shapes. Derived from each meta
   // graph by stripping the `_meta` suffix to yield the partner data
   // graph URI. Op-meta quads from a graph that doesn't follow the
   // suffix convention are skipped — they cannot be paired with a
@@ -306,7 +315,7 @@ function processSharedMemory(
   // unsoundness.
   const allowedRootsByDataGraph = new Map<string, Set<string>>();
   for (const q of wsMetaQuads) {
-    if (q.predicate !== DKG_ROOT_ENTITY) continue;
+    if (q.predicate !== DKG_ROOT_ENTITY && q.predicate !== DKG_PUBLIC_SLICE_ROOT_ENTITY) continue;
     const validForGraph = validOpsByMeta.get(q.graph);
     if (!validForGraph || !validForGraph.has(q.subject)) continue;
     const dataGraph = swmDataGraphFromMetaGraph(q.graph, contextGraphId, META_SUFFIX, effectiveRegisteredSubGraphNames);
@@ -353,7 +362,10 @@ function processSharedMemory(
   const entityCreators = new Map<string, { dataGraph: string; entity: string; creator: string }>();
   for (const q of wsMetaQuads) {
     const validForGraph = validOpsByMeta.get(q.graph);
-    if (q.predicate === DKG_ROOT_ENTITY && validForGraph?.has(q.subject)) {
+    if (
+      (q.predicate === DKG_ROOT_ENTITY || q.predicate === DKG_PUBLIC_SLICE_ROOT_ENTITY) &&
+      validForGraph?.has(q.subject)
+    ) {
       const dataGraph = swmDataGraphFromMetaGraph(q.graph, contextGraphId, META_SUFFIX, effectiveRegisteredSubGraphNames);
       if (!dataGraph) continue;
       const entity = q.object.startsWith('"') ? stripLiteral(q.object) : q.object;

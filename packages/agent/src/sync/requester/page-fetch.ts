@@ -349,15 +349,15 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     }
   } catch (err) {
     const denied = (err as Error & { syncDenied?: boolean }).syncDenied === true;
-    // Private SWM recovery is all-or-nothing at the apply boundary, but the
-    // transfer itself must be resumable. Large curated graphs need hundreds of
-    // pages; discarding every successfully received page after one transport
-    // reset makes completion statistically impossible on a reconnecting relay.
-    // Preserve a proven-active responder session and its cursor when this round
-    // advanced. swm-recovery.ts retains the matching quads until both phases
-    // complete, so returning a partial result here cannot expose partial state.
+    // SWM transfers must be resumable in both recovery and normal incremental
+    // mode. Large curated graphs need hundreds of pages; discarding every
+    // successfully received page after one transport reset makes completion
+    // statistically impossible on a reconnecting relay. Preserve the active
+    // responder session, cursor, and current round's quads whenever an SWM
+    // transfer advanced. Recovery remains all-or-nothing at its apply boundary;
+    // normal SWM safely union-applies the verified partial batch.
     if (
-      recovery &&
+      includeSharedMemory &&
       !denied &&
       !signal?.aborted &&
       isSyncTransportFailure(err) &&
@@ -369,7 +369,8 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       rememberUnfinishedSyncResponderSession(checkpointKey, responderSession);
       logWarn(
         ctx,
-        `Preserving partial recovery for \"${contextGraphId}\" (${phase}) at offset ${offset} after: ` +
+        `Preserving partial ${recovery ? 'recovery' : 'shared-memory sync'} for \"${contextGraphId}\" ` +
+        `(${phase}) at offset ${offset} after: ` +
         `${err instanceof Error ? err.message : String(err)}`,
       );
       phaseTelemetry.finish('timed_out', allQuads.length);
