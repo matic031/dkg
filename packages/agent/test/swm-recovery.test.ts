@@ -233,4 +233,62 @@ describe('recoverContextGraphSwm (fetch → verify → replace)', () => {
     expect(second.completed).toBe(true);
     expect(second.insertedDataQuads).toBe(2);
   });
+
+  it('rejects a complete but incoherent meta/data pair and retries both phases fresh', async () => {
+    const store = new OxigraphStore();
+    stores.push(store);
+    await store.insert([{ subject: SUBJ, predicate: STATUS, object: '"v1"', graph: WS }]);
+
+    const sourceData: Quad[] = [
+      { subject: SUBJ, predicate: STATUS, object: '"v2"', graph: WS },
+    ];
+    const sourceMeta: Quad[] = [
+      { subject: 'urn:op:coherent', predicate: 'http://dkg.io/ontology/rootEntity', object: SUBJ, graph: WS_META },
+    ];
+    let verificationRounds = 0;
+    let metaFetches = 0;
+    let dataFetches = 0;
+    const warnings: string[] = [];
+    const deps = {
+      ...makeDeps(store, sourceData, sourceMeta),
+      fetchSyncPages: async (
+        _c: OperationContext, _p: string, _cg: string, _inc: boolean, phase: 'data' | 'meta',
+      ): Promise<SyncPageResult> => {
+        if (phase === 'meta') metaFetches += 1;
+        else dataFetches += 1;
+        return page(phase === 'meta' ? sourceMeta : sourceData);
+      },
+      processSharedMemoryBatch: async (dataQuads: Quad[], metaQuads: Quad[]) => {
+        verificationRounds += 1;
+        if (verificationRounds === 1) {
+          return {
+            verifiedData: [],
+            verifiedMeta: metaQuads,
+            entityCreators: [],
+            droppedDataTriples: dataQuads.length,
+          };
+        }
+        return {
+          verifiedData: dataQuads,
+          verifiedMeta: metaQuads,
+          entityCreators: [{ dataGraph: WS, entity: SUBJ, creator: 'peer-source' }],
+          droppedDataTriples: 0,
+        };
+      },
+      logWarn: (_ctx: OperationContext, message: string) => warnings.push(message),
+    };
+
+    const first = await recoverContextGraphSwm(deps);
+    expect(first.completed).toBe(false);
+    expect(first.insertedMetaQuads).toBe(0);
+    expect(await statusValues(store)).toEqual(['"v1"']);
+    expect(warnings.some((message) => message.includes('rejected an incoherent snapshot'))).toBe(true);
+
+    const second = await recoverContextGraphSwm(deps);
+    expect(second.completed).toBe(true);
+    expect(second.insertedDataQuads).toBe(1);
+    expect(metaFetches).toBe(2);
+    expect(dataFetches).toBe(2);
+    expect(await statusValues(store)).toEqual(['"v2"']);
+  });
 });

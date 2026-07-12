@@ -414,6 +414,66 @@ describe('DKGAgent sync fetch coalescing', () => {
     }
   });
 
+  it('single-flights private recovery across overlapping callers with different outer options', async () => {
+    const firstMetaFetch = deferred<SyncPageResult>();
+    let fetchCalls = 0;
+    const agent = await createAgentWithSend(
+      async () => new Uint8Array(0),
+      { syncGlobalMaxInflight: 1, syncGlobalQueueLimit: 0 },
+    );
+    const sharedMemorySyncPlan = {
+      eligibleContextGraphIds: ['private-cg'],
+      publicContextGraphIds: [] as string[],
+      privateRecoverFromCurator: ['private-cg'],
+    };
+    (agent as any).listSubGraphs = async () => [];
+    (agent as any).fetchSyncPages = async (...args: unknown[]) => {
+      fetchCalls++;
+      const phase = String(args[4]);
+      if (fetchCalls === 1) return firstMetaFetch.promise;
+      return emptySyncPage(phase);
+    };
+    (agent as any).getOrCreateSyncVerifyWorker = () => ({
+      processSharedMemoryBatch: async () => ({
+        verifiedData: [],
+        verifiedMeta: [],
+        totalFetchedDataQuads: 0,
+        totalFetchedMetaQuads: 0,
+        droppedDataTriples: 0,
+        emptyResponses: 1,
+        entityCreators: [],
+      }),
+    });
+
+    try {
+      const first = (agent as any).syncSharedMemoryFromPeerDetailed(
+        PEER_A,
+        ['private-cg'],
+        { sharedMemorySyncPlan },
+      );
+      const second = (agent as any).syncSharedMemoryFromPeerDetailed(
+        PEER_A,
+        ['private-cg'],
+        { sharedMemorySyncPlan, stopOnBackoffWorthyFailure: true },
+      );
+      await waitFor(() => fetchCalls === 1);
+      expect(fetchCalls).toBe(1);
+
+      firstMetaFetch.resolve(emptySyncPage('meta'));
+      await Promise.all([first, second]);
+      expect(fetchCalls).toBe(2);
+
+      await expect((agent as any).syncSharedMemoryFromPeerDetailed(
+        PEER_A,
+        ['private-cg'],
+        { sharedMemorySyncPlan },
+      )).resolves.toMatchObject({ failedPeers: 0 });
+      expect(fetchCalls).toBe(4);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it.each([
     {
       name: 'private-only',

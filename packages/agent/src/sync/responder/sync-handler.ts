@@ -471,7 +471,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
           const queryStartedAt = Date.now();
           const session = prepareResponderSession(
             'Shared memory meta',
-            `${peerId}:swm-meta:${contextGraphId}`,
+            `${peerId}:swm-meta:${request.recovery ? 'recovery' : 'incremental'}:${contextGraphId}`,
             request.syncSessionId,
             offset,
           );
@@ -501,7 +501,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
           const queryStartedAt = Date.now();
           const session = prepareResponderSession(
             'Shared memory data',
-            `${peerId}:swm-data:${contextGraphId}`,
+            `${peerId}:swm-data:${request.recovery ? 'recovery' : 'incremental'}:${contextGraphId}`,
             request.syncSessionId,
             offset,
           );

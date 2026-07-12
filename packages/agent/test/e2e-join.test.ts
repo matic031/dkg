@@ -29,6 +29,7 @@ import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
 
 const CG = 'curated-join-e2e';
+const AUTO_CG = 'curated-auto-join-e2e';
 
 function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -66,6 +67,7 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
   let approvedAddr: string;
   let rejectedAddr: string;
   let existingAddr: string;
+  let autoApprovedAddr: string;
 
   afterAll(async () => {
     try { await curator?.stop(); } catch { /* ignore */ }
@@ -80,6 +82,7 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
       skills: [],
       chainAdapter: sharedChain,
       nodeRole: 'core',
+      autoApproveJoinRequests: [AUTO_CG],
     });
     joiner = await DKGAgent.create({
       kaNumberAllocator: makeTestKaNumberAllocator(),
@@ -106,12 +109,15 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
     const recApprove = await joiner.registerAgent('joiner-approve', { framework: 'test' });
     const recReject = await joiner.registerAgent('joiner-reject', { framework: 'test' });
     const recExisting = await joiner.registerAgent('joiner-existing', { framework: 'test' });
+    const recAuto = await joiner.registerAgent('joiner-auto', { framework: 'test' });
     approvedAddr = recApprove.agentAddress;
     rejectedAddr = recReject.agentAddress;
     existingAddr = recExisting.agentAddress;
+    autoApprovedAddr = recAuto.agentAddress;
     expect(approvedAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
     expect(rejectedAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
     expect(existingAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(autoApprovedAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
   }, 25_000);
 
   it('the curator owns a CURATED context graph (join-gated)', async () => {
@@ -120,6 +126,32 @@ describe('E2E: cross-node curated-CG join over real libp2p (shared chain)', () =
     // The joiner is NOT the curator → its join requests must go over the wire.
     expect(await joiner.isCuratorOf(CG)).toBe(false);
   }, 15_000);
+
+  it('auto-approves valid requests only for an explicitly configured graph', async () => {
+    await curator.createContextGraph({
+      id: AUTO_CG,
+      name: 'Auto Join E2E',
+      description: '',
+      accessPolicy: 1,
+    });
+
+    const delegation = await joiner.signJoinRequest(AUTO_CG, autoApprovedAddr);
+    const result = await joiner.forwardJoinRequest(
+      AUTO_CG,
+      delegation,
+      'joiner-auto',
+      curator.peerId,
+    );
+    expect(result.delivered, `forward result: ${JSON.stringify(result)}`).toBeGreaterThanOrEqual(1);
+
+    const allowed = await pollUntil(
+      () => curator.getContextGraphAllowedAgents(AUTO_CG),
+      (rows) => rows.some((addr) => addr.toLowerCase() === autoApprovedAddr.toLowerCase()),
+    );
+    expect(allowed.map((addr) => addr.toLowerCase())).toContain(autoApprovedAddr.toLowerCase());
+
+    expect(await curator.listPendingJoinRequests(AUTO_CG)).toEqual([]);
+  }, 30_000);
 
   it('a join request forwarded over real libp2p lands as PENDING on the curator', async () => {
     const delegation = await joiner.signJoinRequest(CG, approvedAddr);

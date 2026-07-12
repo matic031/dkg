@@ -1662,6 +1662,7 @@ export async function runDaemonInner(
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
     syncReconcilerEnabled: config.syncReconcilerEnabled,
     syncOnConnectEnabled: config.syncOnConnectEnabled,
+    autoApproveJoinRequests: config.autoApproveJoinRequests,
     durableSyncEnabled: config.durableSyncEnabled,
     syncGlobalMaxInflight: config.syncGlobalMaxInflight,
     syncGlobalLimit: config.syncGlobalLimit,

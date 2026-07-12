@@ -281,6 +281,35 @@ export async function recoverContextGraphSwm(
     data.quads, meta.quads, deps.contextGraphId, registered, excluded,
   );
 
+  // A non-empty source DATA snapshot cannot coherently verify to zero roots
+  // and zero rows. This is the signature of overlapping recovery sessions
+  // having spliced a DATA cursor from one immutable responder snapshot with a
+  // META cursor from another (observed remotely as 63,500 data + 4,500 meta).
+  // Never record that as a successful metadata-only recovery. Drop the staged
+  // pair and retry both phases from fresh session ids/cursors.
+  if (
+    data.quads.length > 0 &&
+    processed.verifiedData.length === 0 &&
+    processed.entityCreators.length === 0 &&
+    processed.droppedDataTriples === data.quads.length
+  ) {
+    sessions.delete(key);
+    if (accumulator.meta.checkpointKey) deps.deleteCheckpoint(accumulator.meta.checkpointKey);
+    if (accumulator.data.checkpointKey) deps.deleteCheckpoint(accumulator.data.checkpointKey);
+    deps.logWarn?.(
+      deps.ctx,
+      `SWM recovery for \"${deps.contextGraphId}\" rejected an incoherent snapshot ` +
+      `(${data.quads.length} data, ${meta.quads.length} meta, 0 verified roots); retrying fresh`,
+    );
+    return {
+      replacedRoots: 0,
+      insertedDataQuads: 0,
+      insertedMetaQuads: 0,
+      droppedDataTriples: processed.droppedDataTriples,
+      completed: false,
+    };
+  }
+
   // The verifier worker returns its own arrays. Drop the requester-side copies
   // immediately so a large recovery does not retain both complete snapshots
   // through the store apply (important for 100k–1m-row SWM graphs).

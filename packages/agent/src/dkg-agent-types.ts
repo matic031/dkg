@@ -936,6 +936,13 @@ export interface DKGAgentConfig {
   syncReconcilerEnabled?: boolean;
   /** Emergency switch for all peer-connect sync triggers. Env DKG_SYNC_ON_CONNECT_ENABLED wins. */
   syncOnConnectEnabled?: boolean;
+  /**
+   * Private context graphs whose curator should approve every valid join
+   * request immediately. This is intentionally scoped per graph: enabling it
+   * turns that graph into an open-membership community while preserving the
+   * private transport/read path and curated VM publishing policy.
+   */
+  autoApproveJoinRequests?: string[];
   /** Emergency switch for durable/SWM sync execution. Env DKG_DURABLE_SYNC_ENABLED wins. */
   durableSyncEnabled?: boolean;
   /**

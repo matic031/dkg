@@ -537,16 +537,33 @@ function durableSyncSingleFlightKey(params: {
 function sharedMemorySyncSingleFlightKey(params: {
   remotePeerId: string;
   contextGraphIds: readonly string[];
-  stopOnBackoffWorthyFailure?: boolean;
   publicContextGraphIds: readonly string[];
   privateRecoverFromCurator: readonly string[];
 }): string {
+  // The stop flag controls optional fanout only. It must not fork the transfer:
+  // approval, reconnect, and explicit catch-up can overlap with different stop
+  // preferences while sharing one recovery cursor/snapshot staging area.
   return syncSingleFlightKey('shared-memory-sync', {
     remotePeerId: params.remotePeerId,
     contextGraphIds: params.contextGraphIds,
-    stopOnBackoffWorthyFailure: params.stopOnBackoffWorthyFailure === true,
     publicContextGraphIds: params.publicContextGraphIds,
     privateRecoverFromCurator: params.privateRecoverFromCurator,
+  });
+}
+
+function privateSwmRecoverySingleFlightKey(
+  remotePeerId: string,
+  contextGraphId: string,
+): string {
+  // A private-CG recovery owns one retained meta/data prefix plus one pair of
+  // responder cursors. Join approvals, reconnect catch-up, and explicit sync
+  // can all request that recovery at once, sometimes with different outer
+  // stop/fanout options. Those caller options must not fork the recovery
+  // identity: two writers against the same accumulator/checkpoints can splice
+  // different immutable responder sessions into an incoherent snapshot.
+  return syncSingleFlightKey('private-swm-recovery', {
+    remotePeerId,
+    contextGraphId,
   });
 }
 
@@ -2314,6 +2331,13 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         await this.storePendingJoinRequest(contextGraphId, delegation, agentName);
         // Note: `storePendingJoinRequest` itself now emits JOIN_REQUEST_RECEIVED.
         // No duplicate emit here.
+        if (this.config.autoApproveJoinRequests?.includes(contextGraphId)) {
+          await this.approveJoinRequest(contextGraphId, delegation.agentAddress);
+          this.log.info(
+            requestCtx,
+            `PROTOCOL_JOIN_REQUEST from ${peerTag} for "${contextGraphId}": auto-approved ${delegation.agentAddress}`,
+          );
+        }
         return new TextEncoder().encode(JSON.stringify({ ok: true }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -4073,8 +4097,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.log.warn(ctx, `Skipping shared-memory sync from ${remotePeerId.slice(-8)} (DKG_DURABLE_SYNC_ENABLED=0)`);
       return emptySharedMemorySyncResult();
     }
-    const recoverPrivateContextGraph = (contextGraphId: string) => runRecoverContextGraphSwmFromPeer(
-      {
+    const recoverPrivateContextGraph = (contextGraphId: string) => runSyncSingleFlight(
+      this,
+      privateSwmRecoverySingleFlightKey(remotePeerId, contextGraphId),
+      () => runRecoverContextGraphSwmFromPeer({
         store: this.store,
         listSubGraphs: (id) => this.listSubGraphs(id),
         createContextGraphSyncDeadline: (remaining) => this.createContextGraphSyncDeadline(remaining),
@@ -4095,9 +4121,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         },
         logInfo: (opCtx, message) => this.log.info(opCtx, message),
         logWarn: (opCtx, message) => this.log.warn(opCtx, message),
-      },
-      remotePeerId,
-      contextGraphId,
+      }, remotePeerId, contextGraphId),
     );
     const planned = options?.sharedMemorySyncPlan;
     const plan = planned && sameStringArray(planned.eligibleContextGraphIds, contextGraphIds)
@@ -4108,7 +4132,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const singleFlightKey = sharedMemorySyncSingleFlightKey({
       remotePeerId,
       contextGraphIds,
-      stopOnBackoffWorthyFailure,
       publicContextGraphIds,
       privateRecoverFromCurator,
     });
@@ -4256,38 +4279,42 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.log.warn(ctx, `Skipping SWM recovery from ${remotePeerId.slice(-8)} (DKG_DURABLE_SYNC_ENABLED=0)`);
       return emptySwmRecoveryResult();
     }
-    return withGlobalSyncBackpressure(
-      {
-        policy: resolveSyncGlobalBackpressure(this.config),
-        ctx,
-        label: `swm-recovery:${remotePeerId.slice(-8)}`,
-        logInfo: (opCtx, message) => this.log.info(opCtx, message),
-      },
-      () => runRecoverContextGraphSwmFromPeer(
+    return runSyncSingleFlight(
+      this,
+      privateSwmRecoverySingleFlightKey(remotePeerId, contextGraphId),
+      () => withGlobalSyncBackpressure(
         {
-          store: this.store,
-          listSubGraphs: (id) => this.listSubGraphs(id),
-          createContextGraphSyncDeadline: (remaining) => this.createContextGraphSyncDeadline(remaining),
-          fetchSyncPages: (ctx2, peerId, cgId, includeSharedMemory, phase, graphUri, deadline) =>
-            this.fetchSyncPages(ctx2, peerId, cgId, includeSharedMemory, phase, graphUri, deadline, undefined, undefined, undefined, true),
-          processSharedMemoryBatch: (data, meta, cgId, registered, excluded) =>
-            this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(data, meta, cgId, registered, excluded),
-          recordDrops: (drops, seam) => this.oversizeTombstoneLog.record(drops, seam),
-          invalidateListContextGraphsCache: () => this.invalidateListContextGraphsCache(),
-          markMetaProjectionDirty: (quads) => this.contextGraphMetaProjection.markDirtyFromQuads(quads),
-          setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
-          deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
-          ensureOwnedMap: (ownershipKey) => {
-            if (!this.workspaceOwnedEntities.has(ownershipKey)) {
-              this.workspaceOwnedEntities.set(ownershipKey, new Map());
-            }
-            return this.workspaceOwnedEntities.get(ownershipKey)!;
-          },
+          policy: resolveSyncGlobalBackpressure(this.config),
+          ctx,
+          label: `swm-recovery:${remotePeerId.slice(-8)}`,
           logInfo: (opCtx, message) => this.log.info(opCtx, message),
-          logWarn: (opCtx, message) => this.log.warn(opCtx, message),
         },
-        remotePeerId,
-        contextGraphId,
+        () => runRecoverContextGraphSwmFromPeer(
+          {
+            store: this.store,
+            listSubGraphs: (id) => this.listSubGraphs(id),
+            createContextGraphSyncDeadline: (remaining) => this.createContextGraphSyncDeadline(remaining),
+            fetchSyncPages: (ctx2, peerId, cgId, includeSharedMemory, phase, graphUri, deadline) =>
+              this.fetchSyncPages(ctx2, peerId, cgId, includeSharedMemory, phase, graphUri, deadline, undefined, undefined, undefined, true),
+            processSharedMemoryBatch: (data, meta, cgId, registered, excluded) =>
+              this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(data, meta, cgId, registered, excluded),
+            recordDrops: (drops, seam) => this.oversizeTombstoneLog.record(drops, seam),
+            invalidateListContextGraphsCache: () => this.invalidateListContextGraphsCache(),
+            markMetaProjectionDirty: (quads) => this.contextGraphMetaProjection.markDirtyFromQuads(quads),
+            setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
+            deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
+            ensureOwnedMap: (ownershipKey) => {
+              if (!this.workspaceOwnedEntities.has(ownershipKey)) {
+                this.workspaceOwnedEntities.set(ownershipKey, new Map());
+              }
+              return this.workspaceOwnedEntities.get(ownershipKey)!;
+            },
+            logInfo: (opCtx, message) => this.log.info(opCtx, message),
+            logWarn: (opCtx, message) => this.log.warn(opCtx, message),
+          },
+          remotePeerId,
+          contextGraphId,
+        ),
       ),
     );
   }
