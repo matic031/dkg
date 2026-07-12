@@ -2079,6 +2079,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             // agent (the curator's `_meta` graph hasn't been synced
             // yet at this point on multi-agent nodes).
             this.localApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
+            this.trustedJoinApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
             // Defer the SWM gossip subscribe specifically: the curator's
             // allowlist hasn't synced into our local `_meta` yet, so a
@@ -2197,6 +2198,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           const localHint = this.localApprovedAgentByCG.get(contextGraphId);
           if (localHint && localHint === rejectedAddr.toLowerCase()) {
             this.localApprovedAgentByCG.delete(contextGraphId);
+          }
+          const trustedApproval = this.trustedJoinApprovedAgentByCG.get(contextGraphId);
+          if (trustedApproval && trustedApproval === rejectedAddr.toLowerCase()) {
+            this.trustedJoinApprovedAgentByCG.delete(contextGraphId);
           }
           this.eventBus.emit(DKGEvent.JOIN_REJECTED, {
             contextGraphId,
@@ -4903,6 +4908,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       const sub = this.subscribedContextGraphs.get(contextGraphId);
       if (!sub) continue;
       if (await this.hasConfirmedMetaState(contextGraphId)) {
+        // The durable curator ACL is now local; stop relying on the temporary
+        // trusted join-approved bridge so later revocation follows _meta only.
+        this.trustedJoinApprovedAgentByCG.delete(contextGraphId);
         if (sub.metaSynced !== true) {
           this.setContextGraphSubscription(contextGraphId, { ...sub, metaSynced: true });
         }
@@ -5630,7 +5638,22 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     opts: { callerAgentAddress?: string } = {},
   ): Promise<boolean> {
     if (!(await this.hasConfirmedSharedMemoryMetaState(contextGraphId))) {
-      return false;
+      // A trusted curator has already authenticated and approved this exact
+      // local agent, but the authorization-bearing _meta snapshot can be large
+      // enough to take minutes over a reconnecting relay. Do not deadlock SWM
+      // recovery behind that snapshot: grant only this approved local agent a
+      // temporary read/sync bridge while pendingMeta remains true. A locally
+      // signed join intent is deliberately insufficient; only the map written
+      // by the trusted join-approved handler reaches this branch.
+      const sub = this.subscribedContextGraphs.get(contextGraphId);
+      const approved = this.trustedJoinApprovedAgentByCG.get(contextGraphId);
+      if (!approved || sub?.pendingMeta !== true) return false;
+      const approvedIsLocal = [...this.localAgents.keys()].some(
+        (address) => address.toLowerCase() === approved,
+      );
+      if (!approvedIsLocal) return false;
+      const caller = opts.callerAgentAddress?.toLowerCase();
+      return caller === undefined || caller === approved;
     }
     return this.canReadContextGraph(contextGraphId, {
       callerAgentAddress: opts.callerAgentAddress,

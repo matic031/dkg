@@ -16,6 +16,13 @@ const LOCAL_PEER_ID = '12D3KooWAgentGateLocal';
 interface DKGAgentInternals {
   localAgents: Map<string, AgentKeyRecord>;
   defaultAgentAddress?: string;
+  localApprovedAgentByCG: Map<string, string>;
+  trustedJoinApprovedAgentByCG: Map<string, string>;
+  subscribedContextGraphs: Map<string, {
+    subscribed: boolean;
+    pendingMeta?: boolean;
+    metaSynced?: boolean;
+  }>;
   canReadContextGraph(contextGraphId: string): Promise<boolean>;
   canUseSharedMemoryForContextGraph(
     contextGraphId: string,
@@ -142,6 +149,48 @@ async function querySharedMemoryName(
 }
 
 describe('DKGAgent SWM agent-gate access', () => {
+  it('bridges pending metadata only after a trusted curator approval', async () => {
+    const { agent, internals } = await createAgent();
+    const contextGraphId = 'swm-trusted-approval-pending-meta';
+    const approvedRecord = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'approved-pending-meta',
+    );
+    const otherRecord = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'other-pending-meta',
+    );
+    internals.localAgents.set(approvedRecord.agentAddress, approvedRecord);
+    internals.localAgents.set(otherRecord.agentAddress, otherRecord);
+    internals.defaultAgentAddress = approvedRecord.agentAddress;
+    internals.subscribedContextGraphs.set(contextGraphId, {
+      subscribed: true,
+      pendingMeta: true,
+      metaSynced: false,
+    });
+
+    // Signing a request records intent, not approval. It must not open SWM.
+    internals.localApprovedAgentByCG.set(
+      contextGraphId,
+      approvedRecord.agentAddress.toLowerCase(),
+    );
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId)).toBe(false);
+
+    // The join-approved handler writes this second map only after validating
+    // the decision sender as a curator accepted during join forwarding.
+    internals.trustedJoinApprovedAgentByCG.set(
+      contextGraphId,
+      approvedRecord.agentAddress.toLowerCase(),
+    );
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId)).toBe(true);
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId, {
+      callerAgentAddress: approvedRecord.agentAddress,
+    })).toBe(true);
+    expect(await internals.canUseSharedMemoryForContextGraph(contextGraphId, {
+      callerAgentAddress: otherRecord.agentAddress,
+    })).toBe(false);
+  });
+
   it('does not subscribe to the SWM topic before context graph metadata is confirmed', async () => {
     const { agent, gossip } = await createAgent();
     const contextGraphId = 'swm-agent-unknown';

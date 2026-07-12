@@ -1261,6 +1261,14 @@ export class DKGAgentBase {
    */
   protected readonly localApprovedAgentByCG = new Map<string, string>();
   /**
+   * Requester-side authorization established only after a join decision was
+   * accepted from a trusted curator peer. Unlike localApprovedAgentByCG, this
+   * map is never populated merely by signing a join request, so it can safely
+   * bridge the window while the curator's large _meta snapshot is catching up.
+   * Cleared when metadata is confirmed or the request is rejected.
+   */
+  protected readonly trustedJoinApprovedAgentByCG = new Map<string, string>();
+  /**
    * Symmetric companion to `joinRequestOriginPeers`, populated on the
    * REQUESTER side. When `forwardJoinRequest` broadcasts to all peers,
    * any peer that responds `{ok: true}` is self-claiming curator status
