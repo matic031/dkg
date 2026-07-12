@@ -52,6 +52,7 @@ describe('oversized responder fallback is store-bounded and set-equivalent', () 
     const cgEntity = `did:dkg:context-graph:${cgId}`;
     const meta = `${cgEntity}/_meta`;
     const WM = `"${MemoryLayer.WorkingMemory}"`; // "WM"
+    const SWM = `"${MemoryLayer.SharedWorkingMemory}"`; // "SWM"
     const VM = `"${MemoryLayer.VerifiableMemory}"`; // "VM"
 
     const quads: Quad[] = [
@@ -62,25 +63,29 @@ describe('oversized responder fallback is store-bounded and set-equivalent', () 
       // C / D: activity + join-request prefixes
       { graph: meta, subject: 'did:dkg:activity:act1', predicate: `${DKG_NS}note`, object: '"act"' },
       { graph: meta, subject: 'did:dkg:join-request:jr1', predicate: `${DKG_NS}note`, object: '"jr"' },
-      // E: a non-working lifecycle (kept); its own rows are kept
+      // E: a verifiable lifecycle (kept); its own rows are kept
       { graph: meta, subject: 'urn:lc:vm', predicate: `${DKG_NS}memoryLayer`, object: VM },
       { graph: meta, subject: 'urn:lc:vm', predicate: `${DKG_NS}assertionGraph`, object: 'urn:ag:1' },
       { graph: meta, subject: 'urn:lc:vm', predicate: `${DKG_NS}assertionName`, object: '"myassert"' },
-      // E dual: a subject carrying BOTH a WM and a non-WM layer must be kept
+      // E dual: a subject carrying BOTH a WM and VM layer must be kept
       { graph: meta, subject: 'urn:lc:dual', predicate: `${DKG_NS}memoryLayer`, object: WM },
       { graph: meta, subject: 'urn:lc:dual', predicate: `${DKG_NS}memoryLayer`, object: VM },
-      // F: assertion graph object of a non-working lifecycle → its rows kept
+      // F: assertion graph object of a VM lifecycle → its rows kept
       { graph: meta, subject: 'urn:ag:1', predicate: `${DKG_NS}label`, object: '"assertion-graph-row"' },
-      // G: event subjects referencing the non-working lifecycle (generated + used)
+      // G: event subjects referencing the VM lifecycle (generated + used)
       { graph: meta, subject: 'urn:event:gen', predicate: `${DKG_NS}generated`, object: 'urn:lc:vm' },
       { graph: meta, subject: 'urn:event:gen', predicate: 'http://www.w3.org/ns/prov#generated', object: 'urn:lc:vm' },
       { graph: meta, subject: 'urn:event:used', predicate: 'http://www.w3.org/ns/prov#used', object: 'urn:lc:vm' },
-      // H: an /assertion/ subject ending with a non-working lifecycle's assertion name
+      // H: an /assertion/ subject ending with a VM lifecycle's assertion name
       { graph: meta, subject: `${cgEntity}/assertion/0xabc/myassert`, predicate: `${DKG_NS}label`, object: '"assertion-name-hit"' },
 
       // ---- negatives that MUST be excluded by both paths ----
       // working-only lifecycle, matches no other branch
       { graph: meta, subject: 'urn:lc:wm', predicate: `${DKG_NS}memoryLayer`, object: WM },
+      // SWM lifecycle belongs exclusively to the shared-memory phase
+      { graph: meta, subject: 'urn:lc:swm', predicate: `${DKG_NS}memoryLayer`, object: SWM },
+      { graph: meta, subject: 'urn:lc:swm', predicate: `${DKG_NS}assertionGraph`, object: 'urn:ag:swm' },
+      { graph: meta, subject: 'urn:ag:swm', predicate: `${DKG_NS}label`, object: '"swm-meta-should-be-excluded"' },
       // event referencing a WORKING lifecycle → not an admitted event subject
       { graph: meta, subject: 'urn:event:wm', predicate: 'http://www.w3.org/ns/prov#generated', object: 'urn:lc:wm' },
       // working lifecycle's assertion name must NOT admit a matching /assertion/ subject
@@ -139,7 +144,10 @@ describe('oversized responder fallback is store-bounded and set-equivalent', () 
     expect([...canonical].join('\n')).not.toContain('noise-should-be-excluded');
     expect([...canonical].join('\n')).not.toContain('working-name-should-be-excluded');
     expect([...canonical].join('\n')).not.toContain('empty-name-should-be-excluded');
+    expect([...canonical].join('\n')).not.toContain('swm-meta-should-be-excluded');
     expect(has('urn:event:wm')).toBe(false);
+    expect(has('urn:lc:swm')).toBe(false);
+    expect(has('urn:ag:swm')).toBe(false);
   });
 
   it('TTL-cutoff SWM-data paged fallback matches the canonical filter and stays bounded', async () => {

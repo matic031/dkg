@@ -1,7 +1,7 @@
 import type { OperationContext } from '@origintrail-official/dkg-core';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import { sendSyncRequest } from '../../p2p/sync-transport.js';
-import { markSyncPeerResponded } from '../error-tags.js';
+import { isSyncTransportFailure, markSyncPeerResponded } from '../error-tags.js';
 import { appendInPlace } from '../append-in-place.js';
 import type { SyncPhase } from '../auth/request-build.js';
 import { getSyncCheckpointKey, type SyncCheckpointStore } from '../checkpoint/state.js';
@@ -334,6 +334,40 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     }
   } catch (err) {
     const denied = (err as Error & { syncDenied?: boolean }).syncDenied === true;
+    // Private SWM recovery is all-or-nothing at the apply boundary, but the
+    // transfer itself must be resumable. Large curated graphs need hundreds of
+    // pages; discarding every successfully received page after one transport
+    // reset makes completion statistically impossible on a reconnecting relay.
+    // Preserve a proven-active responder session and its cursor when this round
+    // advanced. swm-recovery.ts retains the matching quads until both phases
+    // complete, so returning a partial result here cannot expose partial state.
+    if (
+      recovery &&
+      !denied &&
+      !signal?.aborted &&
+      isSyncTransportFailure(err) &&
+      !isSyncResponderSessionSupersededError(err) &&
+      responderSession &&
+      offset > resumedFromOffset
+    ) {
+      checkpointStore.set(checkpointKey, offset);
+      rememberUnfinishedSyncResponderSession(checkpointKey, responderSession);
+      logWarn(
+        ctx,
+        `Preserving partial recovery for \"${contextGraphId}\" (${phase}) at offset ${offset} after: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      phaseTelemetry.finish('timed_out', allQuads.length);
+      return {
+        quads: allQuads,
+        bytesReceived,
+        resumedFromOffset,
+        nextOffset: offset,
+        checkpointKey,
+        completed: false,
+        timedOut: true,
+      };
+    }
     if (usesPageSession && isSyncResponderSessionSupersededError(err)) {
       // Exact-message match — only fires IN-PROCESS (same-node tests). Over the
       // wire the responder's "superseded" text is destroyed by the router's
@@ -377,16 +411,14 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
   }
 
   if (usesPageSession && responderSession) {
-    // R10 recovery has its own responder-session scope and MUST rebuild the
-    // COMPLETE state from offset 0 on every (re)try (see swm-recovery
-    // `fetchPhaseFully`, which deletes the checkpoint on a partial abandon). It
-    // must therefore NEVER persist a responder session to resume: reusing the
-    // cached pre-timeout row list on a retry converges to a STALE snapshot (up to
-    // the session TTL old) instead of current state, because the responder's
-    // `refreshRowList` only fires on a NEW syncSessionId (Codex #1173). Drop the
-    // session so the retry mints a fresh id and the responder re-reads.
-    if (timedOut && !recovery) rememberUnfinishedSyncResponderSession(checkpointKey, responderSession);
-    else unfinishedSyncResponderSessions.delete(checkpointKey);
+    // An incomplete recovery deliberately keeps the same immutable responder
+    // snapshot. This makes its retained prefix and OFFSET cursor one consistent
+    // point-in-time transfer; nothing is applied until both phases complete.
+    if (timedOut && (!recovery || offset > resumedFromOffset)) {
+      rememberUnfinishedSyncResponderSession(checkpointKey, responderSession);
+    } else {
+      unfinishedSyncResponderSessions.delete(checkpointKey);
+    }
   }
 
   if (timedOut) {

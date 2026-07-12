@@ -24,7 +24,7 @@ const STATUS = 'http://schema.org/status';
 const ctx: OperationContext = { operationId: 'test', operationName: 'sync' } as never;
 
 function page(quads: Quad[], completed = true): SyncPageResult {
-  return { quads, bytesReceived: 0, resumedFromOffset: 0, nextOffset: quads.length, checkpointKey: 'k', completed };
+  return { quads, bytesReceived: 0, resumedFromOffset: 0, nextOffset: quads.length, checkpointKey: 'k', completed, timedOut: !completed };
 }
 async function statusValues(store: OxigraphStore): Promise<string[]> {
   const r = await store.query(`SELECT ?o WHERE { GRAPH <${WS}> { <${SUBJ}> <${STATUS}> ?o } }`);
@@ -120,5 +120,117 @@ describe('recoverContextGraphSwm (fetch → verify → replace)', () => {
     expect(result.replacedRoots).toBe(0);
     // incomplete fetch → no mutation at all; the prior v1 is untouched (no truncation, no partial replace)
     expect(await statusValues(store)).toEqual(['"v1"']);
+  });
+
+  it('retains completed metadata and resumes data across recovery rounds', async () => {
+    const store = new OxigraphStore();
+    stores.push(store);
+    await store.insert([{ subject: SUBJ, predicate: STATUS, object: '"v1"', graph: WS }]);
+
+    const sourceData: Quad[] = [
+      { subject: SUBJ, predicate: STATUS, object: '"v2"', graph: WS },
+      { subject: SUBJ, predicate: 'http://schema.org/name', object: '"shipment"', graph: WS },
+    ];
+    const sourceMeta: Quad[] = [
+      { subject: 'urn:op:resume', predicate: 'http://dkg.io/ontology/shareOperationId', object: '"resume"', graph: WS_META },
+    ];
+    const checkpoints = new Map<string, number>();
+    let metaFetches = 0;
+    let dataFetches = 0;
+    const deps = {
+      ...makeDeps(store, sourceData, sourceMeta),
+      fetchSyncPages: async (
+        _c: OperationContext, _p: string, _cg: string, _inc: boolean, phase: 'data' | 'meta',
+      ): Promise<SyncPageResult> => {
+        if (phase === 'meta') {
+          metaFetches += 1;
+          return {
+            ...page(sourceMeta),
+            checkpointKey: 'meta-k',
+            timedOut: false,
+          };
+        }
+        dataFetches += 1;
+        if (dataFetches === 1) {
+          return {
+            ...page([sourceData[0]], false),
+            resumedFromOffset: 0,
+            nextOffset: 1,
+            checkpointKey: 'data-k',
+            timedOut: true,
+          };
+        }
+        return {
+          ...page([sourceData[1]]),
+          resumedFromOffset: checkpoints.get('data-k') ?? 0,
+          nextOffset: 2,
+          checkpointKey: 'data-k',
+          timedOut: false,
+        };
+      },
+      setCheckpoint: (key: string, offset: number) => { checkpoints.set(key, offset); },
+      deleteCheckpoint: (key: string) => { checkpoints.delete(key); },
+    };
+
+    const first = await recoverContextGraphSwm(deps);
+    expect(first.completed).toBe(false);
+    expect(await statusValues(store)).toEqual(['"v1"']);
+    expect(checkpoints.get('data-k')).toBe(1);
+
+    const second = await recoverContextGraphSwm(deps);
+    expect(second.completed).toBe(true);
+    expect(metaFetches).toBe(1);
+    expect(dataFetches).toBe(2);
+    expect(second.insertedDataQuads).toBe(2);
+    expect(await statusValues(store)).toEqual(['"v2"']);
+    expect(checkpoints.has('data-k')).toBe(false);
+  });
+
+  it('retains recovery staging when production recreates the store hook wrapper', async () => {
+    const store = new OxigraphStore();
+    stores.push(store);
+    const sourceData: Quad[] = [
+      { subject: SUBJ, predicate: STATUS, object: '"v2"', graph: WS },
+      { subject: SUBJ, predicate: 'http://schema.org/name', object: '"shipment"', graph: WS },
+    ];
+    const checkpoints = new Map<string, number>();
+    let dataFetches = 0;
+    const base = {
+      ...makeDeps(store, sourceData),
+      recoveryStateScope: store,
+      fetchSyncPages: async (
+        _c: OperationContext, _p: string, _cg: string, _inc: boolean, phase: 'data' | 'meta',
+      ): Promise<SyncPageResult> => {
+        if (phase === 'meta') return { ...page([]), checkpointKey: 'meta-wrapper-k' };
+        dataFetches += 1;
+        return dataFetches === 1
+          ? {
+              ...page([sourceData[0]], false),
+              checkpointKey: 'data-wrapper-k',
+              resumedFromOffset: 0,
+              nextOffset: 1,
+            }
+          : {
+              ...page([sourceData[1]]),
+              checkpointKey: 'data-wrapper-k',
+              resumedFromOffset: checkpoints.get('data-wrapper-k') ?? 0,
+              nextOffset: 2,
+            };
+      },
+      setCheckpoint: (key: string, offset: number) => { checkpoints.set(key, offset); },
+      deleteCheckpoint: (key: string) => { checkpoints.delete(key); },
+    };
+    const wrapper = () => ({
+      insert: (quads: Quad[]) => store.insert(quads),
+      deleteByPattern: (pattern: { graph: string; subject: string }) => store.deleteByPattern(pattern),
+      deleteBySubjectPrefix: (graph: string, prefix: string) => store.deleteBySubjectPrefix(graph, prefix),
+    });
+
+    const first = await recoverContextGraphSwm({ ...base, store: wrapper() });
+    expect(first.completed).toBe(false);
+    const second = await recoverContextGraphSwm({ ...base, store: wrapper() });
+
+    expect(second.completed).toBe(true);
+    expect(second.insertedDataQuads).toBe(2);
   });
 });

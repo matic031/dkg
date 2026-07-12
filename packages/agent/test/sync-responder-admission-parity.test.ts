@@ -100,6 +100,7 @@ describe('sync responder graph admission planner', () => {
     const perCgData = `${cgPrefix}/context/1`;
     const perCgMeta = `${cgPrefix}/context/1/_meta`;
     const privateGraph = `${cgPrefix}/_private/secret`;
+    const wmBucket = `${cgPrefix}/_working_memory/0xabc/1`;
     const wmAssertion = `${cgPrefix}/assertion/0xabc/wm-draft`;
     const vmAssertion = `${cgPrefix}/assertion/0xabc/vm-final`;
     const childId = `${cgId}/child`;
@@ -112,6 +113,7 @@ describe('sync responder graph admission planner', () => {
       q(perCgData, 'urn:per-cg:data', 'http://schema.org/name', '"per-cg-data"'),
       q(perCgMeta, 'urn:per-cg:meta', `${DKG_NS}merkleRoot`, '"per-cg-meta"'),
       q(privateGraph, 'urn:private:data', 'http://schema.org/name', '"private-leak"'),
+      q(wmBucket, 'urn:wm:bucket', 'http://schema.org/name', '"wm-bucket-leak"'),
       q(wmAssertion, 'urn:assertion:wm', 'http://schema.org/name', '"wm-assertion-leak"'),
       q(vmAssertion, 'urn:assertion:vm', 'http://schema.org/name', '"vm-assertion"'),
       q(cgMeta, 'urn:lifecycle:wm', `${DKG_NS}assertionGraph`, wmAssertion),
@@ -138,11 +140,13 @@ describe('sync responder graph admission planner', () => {
     expect(graphs.has(vmAssertion)).toBe(true);
     expect(graphs.has(cgMeta)).toBe(false);
     expect(graphs.has(privateGraph)).toBe(false);
+    expect(graphs.has(wmBucket)).toBe(false);
     expect(graphs.has(wmAssertion)).toBe(false);
     expect(graphs.has(childPrefix)).toBe(false);
     expect(out).toContain('"vm-assertion"');
     expect(out).not.toContain('"wm-assertion-leak"');
     expect(out).not.toContain('"private-leak"');
+    expect(out).not.toContain('"wm-bucket-leak"');
     expect(out).not.toContain('"child-leak"');
   });
 
@@ -215,6 +219,7 @@ describe('sync responder graph admission planner', () => {
     const cgMeta = `${cgPrefix}/_meta`;
     const vmAssertion = `${cgPrefix}/assertion/0xabc/final`;
     const wmAssertion = `${cgPrefix}/assertion/0xabc/draft`;
+    const swmAssertion = `${cgPrefix}/assertion/0xabc/shared`;
     const registeredSubGraph = `${cgPrefix}/registered`;
     const childCollisionSubGraph = `${cgPrefix}/child`;
 
@@ -237,6 +242,9 @@ describe('sync responder graph admission planner', () => {
       q(cgMeta, 'urn:lifecycle:wm', `${DKG_NS}memoryLayer`, `"${MemoryLayer.WorkingMemory}"`),
       q(cgMeta, 'urn:lifecycle:wm', `${DKG_NS}assertionGraph`, wmAssertion),
       q(cgMeta, wmAssertion, `${DKG_NS}merkleRoot`, '"wm-assertion-meta-leak"'),
+      q(cgMeta, 'urn:lifecycle:swm', `${DKG_NS}memoryLayer`, `"${MemoryLayer.SharedWorkingMemory}"`),
+      q(cgMeta, 'urn:lifecycle:swm', `${DKG_NS}assertionGraph`, swmAssertion),
+      q(cgMeta, swmAssertion, `${DKG_NS}merkleRoot`, '"swm-assertion-meta-leak"'),
       q(cgMeta, 'urn:noise', 'http://schema.org/name', '"noise-leak"'),
     ]);
 
@@ -263,7 +271,45 @@ describe('sync responder graph admission planner', () => {
     expect(out).not.toContain(`${cgPrefix}/context`);
     expect(out).not.toContain('urn:lifecycle:wm');
     expect(out).not.toContain('wm-assertion-meta-leak');
+    expect(out).not.toContain('urn:lifecycle:swm');
+    expect(out).not.toContain('swm-assertion-meta-leak');
     expect(out).not.toContain('noise-leak');
+  });
+
+  it('keeps SWM-only top metadata out of the durable VM phase', async () => {
+    const cgId = 'planner-swm-only-meta-cg';
+    const cgPrefix = `did:dkg:context-graph:${cgId}`;
+    const cgMeta = `${cgPrefix}/_meta`;
+    const swmAssertion = `${cgPrefix}/assertion/0xabc/shared`;
+    const join = `did:dkg:join-request:${cgId}:0xabc`;
+    const activity = `did:dkg:activity:create-context-graph:${cgId}:1`;
+
+    await store.insert([
+      q(cgMeta, cgPrefix, `${DKG_NS}createdAt`, '"2026-06-01T00:00:00Z"'),
+      q(cgMeta, join, RDF_TYPE, `${DKG_NS}JoinRequest`),
+      q(cgMeta, join, 'http://schema.org/name', '"member"'),
+      q(cgMeta, activity, RDF_TYPE, 'http://www.w3.org/ns/prov#Activity'),
+      q(cgMeta, activity, 'http://schema.org/name', '"created"'),
+      q(cgMeta, 'urn:lifecycle:swm-only', `${DKG_NS}memoryLayer`, `"${MemoryLayer.SharedWorkingMemory}"`),
+      q(cgMeta, 'urn:lifecycle:swm-only', `${DKG_NS}assertionGraph`, swmAssertion),
+      q(cgMeta, swmAssertion, `${DKG_NS}merkleRoot`, '"swm-only-root"'),
+    ]);
+
+    const cap = registerTestSyncHandler(store);
+    const out = await cap.invoke({
+      contextGraphId: cgId,
+      includeSharedMemory: false,
+      phase: 'meta',
+      offset: 0,
+      limit: 5000,
+      syncSessionId: 'swm-only-meta',
+    });
+
+    expect(out).toContain(cgPrefix);
+    expect(out).toContain(join);
+    expect(out).toContain(activity);
+    expect(out).not.toContain('urn:lifecycle:swm-only');
+    expect(out).not.toContain('swm-only-root');
   });
 
   it('uses true codepoint order for graph-level pagination', async () => {

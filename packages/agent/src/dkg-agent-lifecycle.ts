@@ -5896,6 +5896,9 @@ async function runRecoverContextGraphSwmFromPeer(
         source: 'agent.swmRecovery.deleteBySubjectPrefix',
       }),
     },
+    // The hook wrapper above is recreated per recovery call; key resumable
+    // staging to the underlying store so it survives background retry rounds.
+    recoveryStateScope: dependencies.store,
     // Codex high: REPLACE per-root SWM meta (mirror the publisher's
     // deleteMetaForRoot). For each recovered root, drop the op→root-entity
     // links in the curator's fresh-meta graphs, then delete any op left with

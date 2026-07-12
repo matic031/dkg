@@ -511,14 +511,11 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
   });
 
   /**
-   * Codex #1173: the contrast to the test above. A RECOVERY fetch must NOT
-   * persist/resume the responder session across an incomplete round — recovery
-   * rebuilds the COMPLETE state from offset 0 every try, so reusing the responder's
-   * cached pre-timeout row list would converge to a STALE snapshot. On retry it
-   * must reset to offset 0 and mint a FRESH syncSessionId so the responder
-   * re-reads current state.
+   * A recovery transfer keeps one immutable responder snapshot across retry
+   * rounds. The destination graph is still updated only after both phases are
+   * complete, but a relay reset must not throw away hundreds of good pages.
    */
-  it('does NOT reuse the responder session across an incomplete RECOVERY round (mints fresh)', async () => {
+  it('reuses the responder session and cursor across an incomplete RECOVERY round', async () => {
     vi.setSystemTime(1_700_000_000_000);
     const observedBuilds: Array<{ offset: number; syncSessionId: string | undefined }> = [];
     let sendCalls = 0;
@@ -576,15 +573,141 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     const recoverySessionId = observedBuilds[0].syncSessionId;
     expect(typeof recoverySessionId).toBe('string');
 
-    // Retry. With NO persisted recovery session, the requester resets to offset 0
-    // and mints a fresh syncSessionId (vs. the non-recovery test above, which reuses).
+    // Retry resumes the same point-in-time snapshot at the retained cursor.
     await runFetchWithFakeTimers(
       fetchSyncPages(recoveryFetchOpts(1, () => new TextEncoder().encode(''))),
     );
 
     const last = observedBuilds[observedBuilds.length - 1];
-    expect(last.offset).toBe(0); // reset — no resumable session for recovery
-    expect(last.syncSessionId).not.toBe(recoverySessionId); // FRESH, not reused
+    expect(last.offset).toBe(1);
+    expect(last.syncSessionId).toBe(recoverySessionId);
+  });
+
+  it('returns and checkpoints recovery progress when a later page transport resets', async () => {
+    const contextGraphId = 'recovery-transport-resume-cg';
+    const checkpointKey = `${REMOTE_PEER_ID}|${contextGraphId}|swm|data|recovery`;
+    let checkpointOffset = 0;
+    const observedBuilds: Array<{ offset: number; syncSessionId: string | undefined }> = [];
+    let firstRoundSends = 0;
+
+    const options = (send: () => Promise<Uint8Array>) => ({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId,
+      includeSharedMemory: true,
+      phase: 'data' as const,
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 1,
+      syncPageSize: 1,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      recovery: true,
+      checkpointStore: {
+        get: () => checkpointOffset > 0 ? freshCheckpoint(checkpointOffset) : undefined,
+        set: (_key: string, value: number) => { checkpointOffset = value; },
+        delete: () => { checkpointOffset = 0; },
+      },
+      buildSyncRequest: async (
+        _cg: string,
+        offset: number,
+        _limit: number,
+        _includeSharedMemory: boolean,
+        _remotePeerId: string,
+        _phase: unknown,
+        _snapshotRef: unknown,
+        _sinceBatchId: unknown,
+        syncSessionId?: string,
+      ) => {
+        observedBuilds.push({ offset, syncSessionId });
+        return new TextEncoder().encode(`request-${offset}`);
+      },
+      parseAndFilter: async (nquadsText: string) => nquadsText
+        ? {
+            quads: [{
+              subject: 'urn:recovery:subject',
+              predicate: 'urn:recovery:predicate',
+              object: '"value"',
+              graph: GRAPH_URI,
+            }],
+            totalQuads: 1,
+          }
+        : { quads: [], totalQuads: 0 },
+      send: async () => send(),
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    const first = await fetchSyncPages(options(async () => {
+      firstRoundSends += 1;
+      if (firstRoundSends === 1) return new TextEncoder().encode('one-quad-line');
+      throw new Error('The stream has been reset');
+    }));
+    expect(first.completed).toBe(false);
+    expect(first.timedOut).toBe(true);
+    expect(first.nextOffset).toBe(1);
+    expect(first.quads).toHaveLength(1);
+    expect(checkpointOffset).toBe(1);
+    const sessionId = observedBuilds[0].syncSessionId;
+
+    const second = await fetchSyncPages(options(async () => new TextEncoder().encode('')));
+    expect(second.completed).toBe(true);
+    expect(second.resumedFromOffset).toBe(1);
+    expect(observedBuilds[observedBuilds.length - 1]).toEqual({
+      offset: 1,
+      syncSessionId: sessionId,
+    });
+    expect(first.checkpointKey).toBe(checkpointKey);
+  });
+
+  it('fails closed instead of preserving recovery progress after a malformed later page', async () => {
+    const parseError = new Error('malformed recovery N-Quads');
+    let sends = 0;
+    let checkpointOffset = 0;
+
+    const result = fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: 'recovery-malformed-page-cg',
+      includeSharedMemory: true,
+      phase: 'data',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 5_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 1,
+      syncPageSize: 1,
+      syncDeniedResponse: '#DENIED',
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      recovery: true,
+      checkpointStore: {
+        get: () => undefined,
+        set: (_key, value) => { checkpointOffset = value; },
+        delete: () => { checkpointOffset = 0; },
+      },
+      buildSyncRequest: async () => new TextEncoder().encode('request'),
+      parseAndFilter: async (text) => {
+        if (text === 'malformed') throw parseError;
+        return singleQuadParser(text);
+      },
+      send: async () => {
+        sends += 1;
+        return new TextEncoder().encode(sends === 1 ? 'one-quad-line' : 'malformed');
+      },
+      logWarn: noopLog,
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    await expect(result).rejects.toBe(parseError);
+    expect(didSyncPeerRespond(parseError)).toBe(true);
+    expect(isSyncTransportFailure(parseError)).toBe(false);
+    expect(checkpointOffset).toBe(0);
   });
 
   it('restarts durable data checkpoints when the saved unfinished session expires', async () => {

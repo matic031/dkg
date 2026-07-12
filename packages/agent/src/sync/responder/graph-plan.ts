@@ -341,9 +341,11 @@ function createAdmissionContext(
   const isCandidateGraph = (graph: string): boolean => {
     if (graph !== cgPrefix && !graph.startsWith(`${cgPrefix}/`)) return false;
     if (!opts.includeTopMeta && graph === topMetaGraph) return false;
-    // SWM graphs are the dedicated SWM phase's exclusive domain; `/_private` is
-    // never durable-served (see readDurableDataPage's original inline note).
-    if (graph.includes('/_shared_memory')) return false;
+    // WM is local-only and SWM has its own authenticated phase. The uniform
+    // Chorus bucket layout (`/_working_memory/{agent}/{n}`) does not contain
+    // `/assertion/`, so assertion admission alone leaked every WM bucket into
+    // durable sync. Durable serves VM + structural public graphs only.
+    if (graph.includes('/_working_memory') || graph.includes('/_shared_memory')) return false;
     return !graph.includes('/_private');
   };
   let assertionGraphs: Set<string> | null = null;
@@ -849,7 +851,7 @@ async function readAdmittedAssertionGraphs(
       GRAPH <${assertSafeIri(metaGraph)}> {
         ?lifecycle <${DKG_ASSERTION_GRAPH}> ?g ;
                    <${DKG_MEMORY_LAYER}> ?layer .
-        FILTER(?layer != ${sparqlString(MemoryLayer.WorkingMemory)})
+        FILTER(?layer = ${sparqlString(MemoryLayer.VerifiableMemory)})
       }
     }
   `, syncResponderStoreOptions(signal, 'sync.responder.readAdmittedAssertionGraphs'));
@@ -1108,11 +1110,44 @@ async function readDurableMetaRows(
   const registeredSubGraphSubjects = new Set(dedupeStrings(registeredSubGraphNames)
     .filter((name) => validateSubGraphName(name).valid)
     .map((name) => `${cgEntity}/${name}`));
+
+  // Fast path for graphs with no VM at all. A large SWM-only graph can carry
+  // hundreds of thousands of lifecycle rows in top-level `_meta`; loading and
+  // filtering that entire graph just to prove the durable VM lane is empty
+  // delayed page zero long enough to reset libp2p streams. Exact indexed lookups
+  // retain only structural CG/subgraph/join/provenance rows. Real activities and
+  // join requests are typed at write time, unlike arbitrary prefix-shaped noise.
+  const vmProbe = await store.query(`
+    SELECT ?s WHERE {
+      GRAPH <${assertSafeIri(metaGraph)}> {
+        ?s <${DKG_MEMORY_LAYER}> ${sparqlString(MemoryLayer.VerifiableMemory)} .
+      }
+    }
+    LIMIT 1
+  `, syncResponderStoreOptions(signal, 'sync.responder.probeDurableVmMeta'));
+  if (vmProbe.type !== 'bindings' || vmProbe.bindings.length === 0) {
+    const structuralSubjects = [cgEntity, ...registeredSubGraphSubjects];
+    const structural = await store.query(`
+      SELECT DISTINCT ?s ?p ?o WHERE {
+        GRAPH <${assertSafeIri(metaGraph)}> {
+          { VALUES ?s { ${structuralSubjects.map((s) => `<${assertSafeIri(s)}>`).join(' ')} } ?s ?p ?o }
+          UNION { ?s <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG}JoinRequest> . ?s ?p ?o }
+          UNION { ?s <${DKG_ONTOLOGY.RDF_TYPE}> <http://www.w3.org/ns/prov#Activity> . ?s ?p ?o }
+        }
+      }
+    `, syncResponderStoreOptions(signal, 'sync.responder.readStructuralDurableMetaRows'));
+    if (structural.type !== 'bindings') return [];
+    return structural.bindings
+      .map((row) => ({ s: row['s'], p: row['p'], o: row['o'], g: metaGraph }))
+      .filter((row) => row.s && row.p && row.o)
+      .sort(compareRows);
+  }
+
   const rows = await readRowsAcrossGraphs(store, [metaGraph], signal);
-  const nonWorkingLifecycles = new Set<string>();
+  const verifiableLifecycles = new Set<string>();
   for (const row of rows) {
-    if (row.p === DKG_MEMORY_LAYER && stripLiteral(row.o) !== MemoryLayer.WorkingMemory) {
-      nonWorkingLifecycles.add(row.s);
+    if (row.p === DKG_MEMORY_LAYER && stripLiteral(row.o) === MemoryLayer.VerifiableMemory) {
+      verifiableLifecycles.add(row.s);
     }
   }
 
@@ -1120,14 +1155,14 @@ async function readDurableMetaRows(
   const assertionNames = new Set<string>();
   const eventSubjects = new Set<string>();
   for (const row of rows) {
-    if (nonWorkingLifecycles.has(row.s) && row.p === DKG_ASSERTION_GRAPH) {
+    if (verifiableLifecycles.has(row.s) && row.p === DKG_ASSERTION_GRAPH) {
       assertionGraphs.add(row.o);
     }
-    if (nonWorkingLifecycles.has(row.s) && row.p === DKG_ASSERTION_NAME) {
+    if (verifiableLifecycles.has(row.s) && row.p === DKG_ASSERTION_NAME) {
       const name = stripLiteral(row.o);
       if (name) assertionNames.add(name);
     }
-    if ((row.p === PROV_GENERATED || row.p === PROV_USED) && nonWorkingLifecycles.has(row.o)) {
+    if ((row.p === PROV_GENERATED || row.p === PROV_USED) && verifiableLifecycles.has(row.o)) {
       eventSubjects.add(row.s);
     }
   }
@@ -1137,7 +1172,7 @@ async function readDurableMetaRows(
     registeredSubGraphSubjects.has(row.s) ||
     row.s.startsWith('did:dkg:activity:') ||
     row.s.startsWith('did:dkg:join-request:') ||
-    nonWorkingLifecycles.has(row.s) ||
+    verifiableLifecycles.has(row.s) ||
     assertionGraphs.has(row.s) ||
     eventSubjects.has(row.s) ||
     (
@@ -1150,7 +1185,7 @@ async function readDurableMetaRows(
 /**
  * Store-bounded, page-safe equivalent of {@link readDurableMetaRows} used as the
  * oversized-snapshot fallback. It pushes the entire subject-membership predicate
- * into the store (the graph-scaling non-working-lifecycle / event-subject sets
+ * into the store (the graph-scaling verifiable-lifecycle / event-subject sets
  * are expressed as `EXISTS`, never materialized in Node) and pages with
  * `OFFSET`/`LIMIT`, so an intrinsically-oversized durable-meta snapshot syncs
  * without buffering the complete filtered set in heap.
@@ -1175,7 +1210,7 @@ async function readDurableMetaRowsPage(
   if (safeLimit === 0) return [];
   const metaGraph = contextGraphMetaGraphUri(contextGraphId);
   const cgEntity = contextGraphDataGraphUri(contextGraphId);
-  const notWorking = `FILTER(?ml != ${sparqlString(MemoryLayer.WorkingMemory)})`;
+  const isVerifiable = `FILTER(?ml = ${sparqlString(MemoryLayer.VerifiableMemory)})`;
   const registeredSubGraphSubjects = dedupeStrings(registeredSubGraphNames)
     .filter((name) => validateSubGraphName(name).valid)
     .map((name) => `<${assertSafeIri(`${cgEntity}/${name}`)}>`);
@@ -1191,17 +1226,17 @@ async function readDurableMetaRowsPage(
         ${registeredSubGraphClause}
         || STRSTARTS(STR(?s), "did:dkg:activity:")
         || STRSTARTS(STR(?s), "did:dkg:join-request:")
-        || EXISTS { GRAPH ?g { ?s <${DKG_MEMORY_LAYER}> ?ml } ${notWorking} }
-        || EXISTS { GRAPH ?g { ?agLifecycle <${DKG_ASSERTION_GRAPH}> ?s ; <${DKG_MEMORY_LAYER}> ?ml } ${notWorking} }
+        || EXISTS { GRAPH ?g { ?s <${DKG_MEMORY_LAYER}> ?ml } ${isVerifiable} }
+        || EXISTS { GRAPH ?g { ?agLifecycle <${DKG_ASSERTION_GRAPH}> ?s ; <${DKG_MEMORY_LAYER}> ?ml } ${isVerifiable} }
         || EXISTS {
              GRAPH ?g { ?s (<${PROV_GENERATED}>|<${PROV_USED}>) ?evLifecycle . ?evLifecycle <${DKG_MEMORY_LAYER}> ?ml }
-             ${notWorking}
+             ${isVerifiable}
            }
         || (
              CONTAINS(STR(?s), "/assertion/") &&
              EXISTS {
                GRAPH ?g { ?anLifecycle <${DKG_ASSERTION_NAME}> ?an ; <${DKG_MEMORY_LAYER}> ?ml }
-               ${notWorking}
+               ${isVerifiable}
                FILTER(STR(?an) != "")
                FILTER(STRENDS(STR(?s), CONCAT("/", STR(?an))))
              }
