@@ -1,6 +1,6 @@
 import type { Stream } from '@libp2p/interface';
 import type { StreamHandler as DKGStreamHandler } from './types.js';
-import type { DKGNode } from './node.js';
+import { nodeHasDirectPublicAddress, type DKGNode } from './node.js';
 import type { PeerResolver } from './network/peer-resolver.js';
 import {
   MessageStreamPool,
@@ -869,21 +869,21 @@ export class ProtocolRouter {
           protocolId,
           attemptSignal,
           {
-            // Probe peerStore for non-circuit (direct) addresses; the
+            // Probe peerStore for remotely dialable public direct addresses; the
             // fast path uses this to gate whether reusing a LIMITED
             // (circuit-relay-v2) connection is safe or whether
             // libp2p's CM is about to auto-upgrade and prune it
             // mid-stream. See the JSDoc inside
             // `tryReuseExistingConnection` + the PR #537 CI
-            // postmortem for the DCUtR upgrade race detail.
+            // postmortem for the DCUtR upgrade race detail. LAN and loopback
+            // addresses are not viable upgrade targets for a remote peer;
+            // treating them as such discards the only working relay path.
             peerHasDirectAddrs: async (): Promise<boolean> => {
               const peer = await libp2p.peerStore.get(peerId);
               const addrs = peer.addresses ?? [];
-              for (const a of addrs) {
-                const ma = a.multiaddr?.toString?.() ?? '';
-                if (ma && !ma.includes('/p2p-circuit')) return true;
-              }
-              return false;
+              return nodeHasDirectPublicAddress(
+                addrs.map((a) => a.multiaddr?.toString?.() ?? ''),
+              );
             },
             excludeConnections: triedConnections,
           },
@@ -1013,9 +1013,9 @@ interface ReusableConnection {
    * Present (truthy) when libp2p marks this connection as limited
    * (circuit-relay-v2). Limited connections trigger the CM-auto-
    * upgrade race documented in
-   * `docs/archive/UPSTREAM_ISSUE_DRAFT.md` if peerStore has direct
-   * addresses for the peer; the fast path uses this hint plus the
-   * `peerHasDirectAddrs` probe to skip them safely.
+   * `docs/archive/UPSTREAM_ISSUE_DRAFT.md` if peerStore has a remotely
+   * dialable public direct address for the peer; the fast path uses this hint
+   * plus the `peerHasDirectAddrs` probe to skip them safely.
    */
   limits?: unknown;
   newStream: (
@@ -1114,6 +1114,7 @@ export async function tryReuseExistingConnection(
   //
   // For non-limited candidates (direct connections), no upgrade
   // race exists — use them directly without consulting peerStore.
+  // Private/LAN/loopback addresses are not reachable DCUtR upgrade targets.
   // For limited candidates, defer the peerStore.get until needed
   // and memoize so we pay at most one async hop per fast-path
   // attempt regardless of how many limited candidates exist.

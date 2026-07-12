@@ -1165,13 +1165,13 @@ describe('ProtocolRouter', () => {
     // Codex review of PR #537 + CI regression on
     // `e2e-agents.test.ts > agents exchange encrypted chat through
     // a relay (DCUtR upgrade)`: opening a stream on a LIMITED
-    // (circuit-relay-v2) connection when peerStore has direct
-    // addresses for the peer triggers libp2p's connection-manager
-    // auto-upgrade race — CM dials direct, succeeds, prunes the
+    // (circuit-relay-v2) connection when peerStore has a remotely
+    // dialable public address for the peer triggers libp2p's
+    // connection-manager auto-upgrade race — CM dials direct, succeeds, prunes the
     // limited connection mid-stream, the just-opened stream dies
     // and the receiver's `Connection.onIncomingStream → abort`
     // throws an unhandled `StreamStateError`. Guard: skip limited
-    // candidates when peerStore has any non-circuit address.
+    // candidates when peerStore has a remotely dialable public direct address.
     it('skips a limited (circuit-relay) candidate when peerStore has direct addresses (DCUtR upgrade race)', async () => {
       let limitedNewStream = 0;
       let dialCalls = 0;
@@ -1201,6 +1201,39 @@ describe('ProtocolRouter', () => {
       expect(out).toEqual(new Uint8Array([0x66]));
       expect(limitedNewStream).toBe(0);
       expect(dialCalls).toBe(1);
+    });
+
+    it('reuses a limited candidate when peerStore only has unreachable LAN or loopback direct addresses', async () => {
+      let limitedUsed = 0;
+      let dialCalls = 0;
+      const router = makeRouterWithFastPath({
+        connections: [
+          {
+            status: 'open',
+            limits: { bytes: 1024 * 1024 },
+            newStream: async () => {
+              limitedUsed += 1;
+              return makeStubStream(new Uint8Array([0x67])) as any;
+            },
+          },
+        ],
+        peerStoreGet: async () => ({
+          addresses: [
+            { multiaddr: { toString: () => '/ip4/127.0.0.1/tcp/4001' } },
+            { multiaddr: { toString: () => '/ip4/192.168.1.230/tcp/4001' } },
+            { multiaddr: { toString: () => '/ip6/::1/tcp/4001' } },
+          ],
+        }),
+        dialBehavior: async () => {
+          dialCalls += 1;
+          throw new Error('dialProtocol must not replace the only remotely reachable relay path');
+        },
+      });
+
+      const out = await router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]));
+      expect(out).toEqual(new Uint8Array([0x67]));
+      expect(limitedUsed).toBe(1);
+      expect(dialCalls).toBe(0);
     });
 
     // The Window D shape this fast path is meant to heal: a single
