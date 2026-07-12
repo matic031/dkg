@@ -147,6 +147,11 @@ function decodeSyncResponse(responseBytes: Uint8Array): string {
 // unchanged sync protocol, but requesters may still meet A2 pre-fix peers
 // during local/integration rolling tests. Treat it as retryable, not EOF.
 const LEGACY_SYNC_BUSY_RESPONSE = '__DKG_SYNC_BUSY__';
+// An empty response is the legacy sync protocol's EOF marker, but some relayed
+// stream closures also surface as a successful zero-byte response. Requiring
+// the same cursor to return empty twice preserves compatibility with existing
+// responders while preventing a dropped relay from truncating a snapshot.
+const EMPTY_EOF_CONFIRMATIONS = 2;
 
 function makeLegacySyncBusyError(remotePeerId: string, contextGraphId: string, phase: SyncPhase): Error {
   return new Error(`Legacy sync responder busy at ${remotePeerId} for "${contextGraphId}" (${phase})`);
@@ -219,6 +224,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
   const resumedFromOffset = offset;
   let bytesReceived = 0;
   let timedOut = false;
+  let emptyResponsesAtOffset = 0;
   const syncSessionId = usesPageSession
     ? (savedResponderSession?.syncSessionId ?? createResponderSessionId(includeSharedMemory, phase))
     : undefined;
@@ -296,7 +302,16 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
           (error as Error & { syncDenied?: boolean }).syncDenied = true;
           throw error;
         }
-        if (!nquadsText) break;
+        if (!nquadsText) {
+          emptyResponsesAtOffset += 1;
+          if (emptyResponsesAtOffset >= EMPTY_EOF_CONFIRMATIONS) break;
+          logDebug(
+            ctx,
+            `Confirming empty sync response for "${contextGraphId}" at offset=${offset} phase=${phase}`,
+          );
+          continue;
+        }
+        emptyResponsesAtOffset = 0;
 
         const parseStartedAt = Date.now();
         parsed = await parseAndFilter(nquadsText, graphUri, contextGraphId);

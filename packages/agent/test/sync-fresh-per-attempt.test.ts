@@ -317,6 +317,46 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     expect(result.completed).toBe(true);
   });
 
+  it('does not mistake one empty relay response for sync EOF', async () => {
+    let sendCalls = 0;
+    const result = await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: true,
+        phase: 'meta',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 1,
+        syncPageSize: 2,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => freshCheckpoint(0),
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls += 1;
+          return new TextEncoder().encode(sendCalls === 1 ? '' : 'one-quad-line');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
+
+    expect(sendCalls).toBe(2);
+    expect(result.nextOffset).toBe(1);
+    expect(result.completed).toBe(true);
+  });
+
   it('uses one stable sync session id across pages for full durable data sync', async () => {
     const observedBuilds: Array<{
       offset: number;
@@ -379,14 +419,15 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
       }),
     );
 
-    expect(observedBuilds).toHaveLength(2);
-    expect(observedBuilds.map((build) => build.offset)).toEqual([0, 1]);
+    expect(observedBuilds).toHaveLength(3);
+    expect(observedBuilds.map((build) => build.offset)).toEqual([0, 1, 1]);
     expect(observedBuilds.every((build) => build.includeSharedMemory === false)).toBe(true);
     expect(observedBuilds.every((build) => build.phase === 'data')).toBe(true);
     expect(observedBuilds.every((build) => build.sinceBatchId === undefined)).toBe(true);
     expect(typeof observedBuilds[0].syncSessionId).toBe('string');
     expect(observedBuilds[0].syncSessionId?.length).toBeGreaterThan(0);
     expect(observedBuilds[1].syncSessionId).toBe(observedBuilds[0].syncSessionId);
+    expect(observedBuilds[2].syncSessionId).toBe(observedBuilds[0].syncSessionId);
   });
 
   it('uses a fresh durable sync session id for each completed fetch round', async () => {
@@ -1054,10 +1095,11 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
       }),
     );
 
-    expect(observedBuilds).toHaveLength(1);
-    expect(observedBuilds[0].offset).toBe(0);
+    expect(observedBuilds).toHaveLength(2);
+    expect(observedBuilds.map((build) => build.offset)).toEqual([0, 0]);
     expect(typeof observedBuilds[0].syncSessionId).toBe('string');
     expect(observedBuilds[0].syncSessionId?.length).toBeGreaterThan(0);
+    expect(observedBuilds[1].syncSessionId).toBe(observedBuilds[0].syncSessionId);
     expect(deletedCheckpoints).toEqual([`${REMOTE_PEER_ID}|${CG_ID}|durable|data`]);
   });
 
@@ -1116,12 +1158,13 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
       }),
     );
 
-    expect(observedBuilds).toHaveLength(2);
-    expect(observedBuilds.map((build) => build.offset)).toEqual([0, 1]);
+    expect(observedBuilds).toHaveLength(3);
+    expect(observedBuilds.map((build) => build.offset)).toEqual([0, 1, 1]);
     expect(observedBuilds.every((build) => build.sinceBatchId === '42')).toBe(true);
     expect(typeof observedBuilds[0].syncSessionId).toBe('string');
     expect(observedBuilds[0].syncSessionId?.length).toBeGreaterThan(0);
     expect(observedBuilds[1].syncSessionId).toBe(observedBuilds[0].syncSessionId);
+    expect(observedBuilds[2].syncSessionId).toBe(observedBuilds[0].syncSessionId);
   });
 
   /**
